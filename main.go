@@ -1,516 +1,670 @@
-/*
-Copyright SecureKey Technologies Inc. All Rights Reserved.
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-      http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+//=================================================
+//Account.go  包括创建学生 部门账户，更新密码，删除账号，登录的功能。
+//
+//=================================================
 
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"sync"
+	"strconv"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric/bccsp"
-	msp "github.com/hyperledger/fabric/msp"
-	"github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric/core/chaincode/shim"
 	pb "github.com/hyperledger/fabric/protos/peer"
-
-	protos_utils "github.com/hyperledger/fabric/protos/utils"
-	"github.com/op/go-logging"
-
-	config "github.com/hyperledger/fabric-sdk-go/config"
 )
 
-var logger = logging.MustGetLogger("fabric_sdk_go")
+var logger = shim.NewLogger("Account")
 
-// Chain ...
-/**
- * The “Chain” object captures settings for a channel, which is created by
- * the orderers to isolate transactions delivery to peers participating on channel.
- * A chain must be initialized after it has been configured with the list of peers
- * and orderers. The initialization sends a CONFIGURATION transaction to the orderers
- * to create the specified channel and asks the peers to join that channel.
- *
- */
-type Chain struct {
-	name            string // Name of the chain is only meaningful to the client
-	securityEnabled bool   // Security enabled flag
-	peers           map[string]*Peer
-	tcertBatchSize  int // The number of tcerts to get in each batch
-	orderers        map[string]*Orderer
-	clientContext   *Client
+// SimpleChaincode example simple Chaincode implementation
+type SimpleChaincode struct {
 }
 
-// TransactionProposalResponse ...
-/**
- * The TransactionProposalResponse result object returned from endorsers.
- */
-type TransactionProposalResponse struct {
-	Endorser         string
-	ProposalResponse *pb.ProposalResponse
-	Err              error
+//====================================================================================
+//jieyaojilu
+//====================================================================================
+
+type MoveInf struct {
+	Admin2   string `json:"Admin2"`   // 管理员ID
+	Student2 string `json:"Student2"` //学生ID
+	Point    string `json:"Point"`    // 点数
+	Password string `json:"Password"` // Password
+	Message  string `json:"Message"`  // Message
 }
 
-// TransactionResponse ...
-/**
- * The TransactionProposalResponse result object returned from orderers.
- */
-type TransactionResponse struct {
-	Orderer string
-	Err     error
+type Transaction struct {
+	Transaction2  string `json:"Transaction2"`  // Transaction Number
+	AdminID       string `json:"AdminID"`       // 数字资产ID
+	StudentID     string `json:"StudentID"`     // 管理员ID
+	AdminPassword string `json:"AdminPassword"` //学生ID
+	Money         string `json:"Money"`         // 点数
+	Time          string `json:"Time"`          //交易时间
+	message       string `json:"message"`       //Message
 }
 
-// NewChain ...
-/**
- * @param {string} name to identify different chain instances. The naming of chain instances
- * is enforced by the ordering service and must be unique within the blockchain network
- * @param {Client} clientContext An instance of {@link Client} that provides operational context
- * such as submitting User etc.
- */
-func NewChain(name string, client *Client) (*Chain, error) {
-	if name == "" {
-		return nil, fmt.Errorf("Failed to create Chain. Missing requirement 'name' parameter.")
+//====================================================================================
+//学生角色
+//====================================================================================
+type Student struct {
+	Xuehao   string `json:"xuehao"`
+	Name     string `json:"name"`
+	School   string `json:"school"`
+	Password string `json:"password"`
+	Email    string `json:"email"`
+	Money    string `json:"money"`
+}
+
+//====================================================================================
+//部门角色
+//====================================================================================
+type Admin struct {
+	Gonghao  string `json:"gonghao"`
+	Name     string `json:"name"`
+	School   string `json:"school"`
+	Password string `json:"password"`
+	Partment string `json:"partment"`
+}
+
+func (t *SimpleChaincode) Init(stub shim.ChaincodeStubInterface) pb.Response {
+	return shim.Success(nil)
+}
+
+func (t *SimpleChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
+	logger.Info("########### Account Invoke ###########")
+
+	function, args := stub.GetFunctionAndParameters()
+
+	if function == "CreateStudent" {
+		return t.CreateStudent(stub, args)
 	}
-	if client == nil {
-		return nil, fmt.Errorf("Failed to create Chain. Missing requirement 'clientContext' parameter.")
+	if function == "CreateAdmin" {
+		return t.CreateAdmin(stub, args)
 	}
-	p := make(map[string]*Peer)
-	o := make(map[string]*Orderer)
-	c := &Chain{name: name, securityEnabled: config.IsSecurityEnabled(), peers: p,
-		tcertBatchSize: config.TcertBatchSize(), orderers: o, clientContext: client}
-	logger.Infof("Constructed Chain instance: %v", c)
-
-	return c, nil
-}
-
-// GetName ...
-/**
- * Get the chain name.
- * @returns {string} The name of the chain.
- */
-func (c *Chain) GetName() string {
-	return c.name
-}
-
-// IsSecurityEnabled ...
-/**
- * Determine if security is enabled.
- */
-func (c *Chain) IsSecurityEnabled() bool {
-	return c.securityEnabled
-}
-
-// GetTCertBatchSize ...
-/**
- * Get the tcert batch size.
- */
-func (c *Chain) GetTCertBatchSize() int {
-	return c.tcertBatchSize
-}
-
-// SetTCertBatchSize ...
-/**
- * Set the tcert batch size.
- */
-func (c *Chain) SetTCertBatchSize(batchSize int) {
-	c.tcertBatchSize = batchSize
-}
-
-// AddPeer ...
-/**
- * Add peer endpoint to chain.
- * @param {Peer} peer An instance of the Peer that has been initialized with URL,
- * TLC certificate, and enrollment certificate.
- */
-func (c *Chain) AddPeer(peer *Peer) {
-	c.peers[peer.GetURL()] = peer
-}
-
-// RemovePeer ...
-/**
- * Remove peer endpoint from chain.
- * @param {Peer} peer An instance of the Peer.
- */
-func (c *Chain) RemovePeer(peer *Peer) {
-	delete(c.peers, peer.GetURL())
-}
-
-// GetPeers ...
-/**
- * Get peers of a chain from local information.
- * @returns {[]Peer} The peer list on the chain.
- */
-func (c *Chain) GetPeers() []*Peer {
-	var peersArray []*Peer
-	for _, v := range c.peers {
-		peersArray = append(peersArray, v)
+	if function == "StudentUpdatePassword" {
+		return t.StudentUpdatePassword(stub, args)
 	}
-	return peersArray
-}
-
-// AddOrderer ...
-/**
- * Add orderer endpoint to a chain object, this is a local-only operation.
- * A chain instance may choose to use a single orderer node, which will broadcast
- * requests to the rest of the orderer network. Or if the application does not trust
- * the orderer nodes, it can choose to use more than one by adding them to the chain instance.
- * All APIs concerning the orderer will broadcast to all orderers simultaneously.
- * @param {Orderer} orderer An instance of the Orderer class.
- */
-func (c *Chain) AddOrderer(orderer *Orderer) {
-	c.orderers[orderer.url] = orderer
-}
-
-// RemoveOrderer ...
-/**
- * Remove orderer endpoint from a chain object, this is a local-only operation.
- * @param {Orderer} orderer An instance of the Orderer class.
- */
-func (c *Chain) RemoveOrderer(orderer *Orderer) {
-	delete(c.orderers, orderer.url)
-
-}
-
-// GetOrderers ...
-/**
- * Get orderers of a chain.
- */
-func (c *Chain) GetOrderers() []*Orderer {
-	var orderersArray []*Orderer
-	for _, v := range c.orderers {
-		orderersArray = append(orderersArray, v)
+	if function == "AdminUpdatePassword" {
+		return t.AdminUpdatePassword(stub, args)
 	}
-	return orderersArray
-}
 
-// InitializeChain ...
-/**
- * Calls the orderer(s) to start building the new chain, which is a combination
- * of opening new message stream and connecting the list of participating peers.
- * This is a long-running process. Only one of the application instances needs
- * to call this method. Once the chain is successfully created, other application
- * instances only need to call getChain() to obtain the information about this chain.
- * @returns {bool} Whether the chain initialization process was successful.
- */
-func (c *Chain) InitializeChain() bool {
-	return false
-}
-
-// UpdateChain ...
-/**
- * Calls the orderer(s) to update an existing chain. This allows the addition and
- * deletion of Peer nodes to an existing chain, as well as the update of Peer
- * certificate information upon certificate renewals.
- * @returns {bool} Whether the chain update process was successful.
- */
-func (c *Chain) UpdateChain() bool {
-	return false
-}
-
-// IsReadonly ...
-/**
- * Get chain status to see if the underlying channel has been terminated,
- * making it a read-only chain, where information (transactions and states)
- * can be queried but no new transactions can be submitted.
- * @returns {bool} Is read-only, true or not.
- */
-func (c *Chain) IsReadonly() bool {
-	return false //to do
-}
-
-// QueryInfo ...
-/**
- * Queries for various useful information on the state of the Chain
- * (height, known peers).
- * @returns {object} With height, currently the only useful info.
- */
-func (c *Chain) QueryInfo() {
-	//to do
-}
-
-// QueryBlock ...
-/**
- * Queries the ledger for Block by block number.
- * @param {int} blockNumber The number which is the ID of the Block.
- * @returns {object} Object containing the block.
- */
-func (c *Chain) QueryBlock(blockNumber int) {
-	//to do
-}
-
-// QueryTransaction ...
-/**
- * Queries the ledger for Transaction by number.
- * @param {int} transactionID
- * @returns {object} Transaction information containing the transaction.
- */
-func (c *Chain) QueryTransaction(transactionID int) {
-	//to do
-}
-
-// CreateTransactionProposal ...
-/**
- * Create  a proposal for transaction. This involves assembling the proposal
- * with the data (chaincodeName, function to call, arguments, transient data, etc.) and signing it using the private key corresponding to the
- * ECert to sign.
- */
-func (c *Chain) CreateTransactionProposal(chaincodeName string, chainID string, args []string, sign bool, txid string, transientData []byte) (*pb.SignedProposal, *pb.Proposal, error) {
-
-	argsArray := make([][]byte, len(args))
-	for i, arg := range args {
-		argsArray[i] = []byte(arg)
+	if function == "QueryAccount" {
+		return t.QueryAccount(stub, args)
 	}
-	ccis := &pb.ChaincodeInvocationSpec{ChaincodeSpec: &pb.ChaincodeSpec{
-		Type: pb.ChaincodeSpec_GOLANG, ChaincodeID: &pb.ChaincodeID{Name: chaincodeName},
-		Input: &pb.ChaincodeInput{Args: argsArray}}}
+	if function == "DeleteStudent" {
+		return t.DeleteStudent(stub, args)
+	}
+	if function == "DeleteAdmin" {
+		return t.DeleteAdmin(stub, args)
+	}
+	if function == "loginAdmin" {
+		return t.loginAdmin(stub, args)
+	}
+	if function == "loginStudent" {
+		return t.loginStudent(stub, args)
+	}
+	if function == "movePoint" {
+		return t.movePoint(stub, args)
+	}
+	if function == "getHistoryForKey" {
+		return t.getHistoryForKey(stub, args)
+	}
+	if function == "CreatCredit" {
+		return t.CreatCredit(stub, args)
+	}
+	logger.Errorf("Unknown action, check the first argument, must be one of 'CreateAccount', 'ChangePassword', 'Verify', 'DeleteAccount', or 'QueryAccount'. But got: %v", args[0])
+	return shim.Error(fmt.Sprintf("Unknown action, check the first argument, must be one of 'CreateAccount', 'ChangePassword', 'Verify', 'DeleteAccount', or 'QueryAccount'. But got: %v", args[0]))
+}
 
-	user, err := c.clientContext.GetUserContext("")
+//============================================================================================================
+//创建学生账号
+//============================================================================================================
+func (t *SimpleChaincode) CreateStudent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	fmt.Println("CreateStudent")
+
+	if len(args) != 6 {
+		return shim.Error("Incorrect number of arguments. Expecting 6")
+	}
+
+	var student Student
+	student.Xuehao = args[0]
+	student.Name = args[1]
+	student.Password = args[2]
+	student.School = args[3]
+	student.Email = args[4]
+	student.Money = args[5]
+
+	Bytes, _ := json.Marshal(student)
+
+	// ==== Check if account already exists ====
+	bytes, err := stub.GetState(student.Xuehao)
 	if err != nil {
-		return nil, nil, fmt.Errorf("GetUserContext return error: %s", err)
+		return shim.Error("Failed to get this student: " + err.Error())
 	}
-	serializedIdentity := &msp.SerializedIdentity{Mspid: config.GetMspID(), IdBytes: user.GetEnrollmentCertificate()}
-	creatorID, err := proto.Marshal(serializedIdentity)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Could not Marshal serializedIdentity, err %s", err)
-	}
-	// create a proposal from a ChaincodeInvocationSpec
-	proposal, err := protos_utils.CreateChaincodeProposalWithTransient(txid, common.HeaderType_ENDORSER_TRANSACTION, chainID, ccis, creatorID, transientData)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Could not create chaincode proposal, err %s", err)
+	if bytes != nil {
+		return shim.Error("This student already exists: " + student.Xuehao)
 	}
 
-	proposalBytes, err := protos_utils.GetBytesProposal(proposal)
+	//create
+	err = stub.PutState(student.Xuehao, Bytes)
 	if err != nil {
-		return nil, nil, err
+		return shim.Error(err.Error())
 	}
-	cryptoSuite := c.clientContext.GetCryptoSuite()
-	digest, err := cryptoSuite.Hash(proposalBytes, &bccsp.SHAOpts{})
-	if err != nil {
-		return nil, nil, err
-	}
-	signature, err := cryptoSuite.Sign(user.GetPrivateKey(),
-		digest, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	signedProposal := &pb.SignedProposal{ProposalBytes: proposalBytes, Signature: signature}
-	return signedProposal, proposal, nil
+
+	return shim.Success([]byte(Bytes))
+
 }
 
-// SendTransactionProposal ...
-// Send  the created proposal to peer for endorsement.
-func (c *Chain) SendTransactionProposal(signedProposal *pb.SignedProposal, retry int) (map[string]*TransactionProposalResponse, error) {
-	if c.peers == nil || len(c.peers) == 0 {
-		return nil, fmt.Errorf("peers is nil")
-	}
-	if signedProposal == nil {
-		return nil, fmt.Errorf("signedProposal is nil")
-	}
-	transactionProposalResponseMap := make(map[string]*TransactionProposalResponse)
-	var wg sync.WaitGroup
-	for _, p := range c.peers {
-		wg.Add(1)
-		go func(peer *Peer, wg *sync.WaitGroup, tprm map[string]*TransactionProposalResponse) {
-			defer wg.Done()
-			var err error
-			var proposalResponse *pb.ProposalResponse
-			var transactionProposalResponse *TransactionProposalResponse
-			logger.Debugf("Send ProposalRequest to peer :%s\n", peer.GetURL())
-			if proposalResponse, err = peer.SendProposal(signedProposal); err != nil {
-				logger.Debugf("Receive Error Response :%v\n", proposalResponse)
-				transactionProposalResponse = &TransactionProposalResponse{peer.GetURL(), nil, fmt.Errorf("Error calling endorser '%s':  %s", peer.GetURL(), err)}
-			} else {
-				prp1, _ := protos_utils.GetProposalResponsePayload(proposalResponse.Payload)
-				act1, _ := protos_utils.GetChaincodeAction(prp1.Extension)
-				logger.Debugf("%s ProposalResponsePayload Extension ChaincodeAction Results\n%s\n", peer.GetURL(), string(act1.Results))
+//============================================================================================================
+//创建部门账号
+//============================================================================================================
+func (t *SimpleChaincode) CreateAdmin(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	fmt.Println("CreateAdmin")
 
-				logger.Debugf("Receive Proposal ChaincodeActionResponse :%v\n", proposalResponse)
-				transactionProposalResponse = &TransactionProposalResponse{peer.GetURL(), proposalResponse, nil}
-			}
-			tprm[transactionProposalResponse.Endorser] = transactionProposalResponse
-		}(p, &wg, transactionProposalResponseMap)
+	if len(args) != 5 {
+		return shim.Error("Incorrect number of arguments. Expecting 6")
 	}
-	wg.Wait()
-	return transactionProposalResponseMap, nil
+
+	var admin Admin
+	admin.Gonghao = args[0]
+	admin.Name = args[1]
+	admin.Password = args[2]
+	admin.School = args[3]
+	admin.Partment = args[4]
+
+	Bytes, _ := json.Marshal(admin)
+
+	// ==== Check if account already exists ====
+	bytes, err := stub.GetState(admin.Gonghao)
+	if err != nil {
+		return shim.Error("Failed to get this admin: " + err.Error())
+	}
+	if bytes != nil {
+		return shim.Error("This admin already exists: " + admin.Gonghao)
+	}
+
+	//create
+	err = stub.PutState(admin.Gonghao, Bytes)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	return shim.Success([]byte(Bytes))
+
 }
 
-// CreateTransaction ...
-/**
- * Create a transaction with proposal response, following the endorsement policy.
- */
-func (c *Chain) CreateTransaction(proposal *pb.Proposal, resps []*pb.ProposalResponse) (*pb.Transaction, error) {
-	if len(resps) == 0 {
-		return nil, fmt.Errorf("At least one proposal response is necessary")
+//======================================================================================================
+// 更改学生密码
+// args: 学号|原密码|新密码
+//======================================================================================================
+func (t *SimpleChaincode) StudentUpdatePassword(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	fmt.Println("UpdatePassword")
+
+	if len(args) != 3 {
+		return shim.Error("Incorrect number of arguments. Expecting 3")
 	}
 
-	// the original header
-	hdr, err := protos_utils.GetHeader(proposal.Header)
+	//var account Account
+	accountID := args[0]       //学号
+	accountPassword := args[1] //旧密码
+	newPassword := args[2]     //新密码
+	var err error
+
+	Bytes, _ := stub.GetState(accountID)
 	if err != nil {
-		return nil, fmt.Errorf("Could not unmarshal the proposal header")
+		return shim.Error("Failed to get account: " + err.Error())
 	}
+	if Bytes == nil {
+		return shim.Error("This account does not exists: " + accountID)
+	}
+	var student Student
 
-	// the original payload
-	pPayl, err := protos_utils.GetChaincodeProposalPayload(proposal.Payload)
+	err = json.Unmarshal(Bytes, &student)
 	if err != nil {
-		return nil, fmt.Errorf("Could not unmarshal the proposal payload")
+		return shim.Error("Failed to get account: " + err.Error())
 	}
-
-	// get header extensions so we have the visibility field
-	hdrExt, err := protos_utils.GetChaincodeHeaderExtension(hdr)
+	if student.Password == accountPassword {
+		student.Password = newPassword
+	} else {
+		return shim.Error("wrong password")
+	}
+	bytes, _ := json.Marshal(student)
+	err = stub.PutState(accountID, bytes) //这个地方会报错？？是否需要重新putstate?
 	if err != nil {
-		return nil, err
+		return shim.Error(err.Error())
 	}
 
-	// This code is commented out because the ProposalResponsePayload Extension ChaincodeAction Results
-	// return from endorsements is different so the compare will fail
+	return shim.Success([]byte("{\"updatepassword\":\"sucessful\"}"))
 
-	//	var a1 []byte
-	//	for n, r := range resps {
-	//		if n == 0 {
-	//			a1 = r.Payload
-	//			if r.Response.Status != 200 {
-	//				return nil, fmt.Errorf("Proposal response was not successful, error code %d, msg %s", r.Response.Status, r.Response.Message)
-	//			}
-	//			continue
-	//		}
+}
 
-	//		if bytes.Compare(a1, r.Payload) != 0 {
-	//			return nil, fmt.Errorf("ProposalResponsePayloads do not match")
-	//		}
-	//	}
+//======================================================================================================
+// 更改部门密码
+// args: 工号|原密码|新密码
+//======================================================================================================
+func (t *SimpleChaincode) AdminUpdatePassword(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	fmt.Println("UpdatePassword")
 
-	for _, r := range resps {
-		if r.Response.Status != 200 {
-			return nil, fmt.Errorf("Proposal response was not successful, error code %d, msg %s", r.Response.Status, r.Response.Message)
+	if len(args) != 3 {
+		return shim.Error("Incorrect number of arguments. Expecting 3")
+	}
+
+	//var account Account
+	accountID := args[0]       //工号
+	accountPassword := args[1] //旧密码
+	newPassword := args[2]     //新密码
+	var err error
+
+	Bytes, _ := stub.GetState(accountID)
+	if err != nil {
+		return shim.Error("{\"Failed to get account\": \"" + err.Error() + "\"}")
+	}
+	if Bytes == nil {
+		return shim.Error("This accountt does not exists: " + accountID)
+	}
+	var admin Admin
+
+	err = json.Unmarshal(Bytes, &admin)
+	if err != nil {
+		return shim.Error("Failed to get account: " + err.Error())
+	}
+	if admin.Password == accountPassword {
+		admin.Password = newPassword
+	} else {
+		return shim.Error("{\"result\":\"wrong password\"}")
+	}
+
+	bytes, _ := json.Marshal(admin)
+	err = stub.PutState(accountID, bytes) //这个地方会报错？？是否需要重新putstate?
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	return shim.Success([]byte("{\"updatepassword\":\"sucessful\"}"))
+
+}
+
+//==============================================================================
+// 查询账户是否存在
+// args: ID
+//==============================================================================
+func (t *SimpleChaincode) QueryAccount(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 1 {
+		return shim.Error("Incorrect number of arguments. Expecting 1")
+	}
+
+	accountID := args[0]
+
+	// Get the state from the ledger
+	bytes, err := stub.GetState(accountID)
+	if err != nil {
+		jsonResp := "{\"Error\":\"Failed to get state for " + accountID + "\"}"
+		return shim.Error(jsonResp)
+	}
+	if bytes == nil {
+		jsonResp := "{\"Error\":\"Nil amount for " + accountID + "\"}"
+		return shim.Error(jsonResp)
+	}
+
+	return shim.Success(bytes)
+}
+
+//=============================================================================================
+//zhuanyizixhan simple
+//args:
+//=============================================================================================
+func (t *SimpleChaincode) movePoint(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 5 {
+		return shim.Error("Incorrect number of arguments. Expecting 5")
+	}
+
+	var transaction MoveInf
+	var err error
+	transaction.Admin2 = args[0]
+	transaction.Student2 = args[1]
+	transaction.Password = args[3]
+	transaction.Message = args[4]
+	accountPassword := args[3]
+	//transaction.Point, err = strconv.Atoi(args[2])
+
+	// ==== Check if Seller exists ====
+	bytesAdmin, err := stub.GetState(transaction.Admin2)
+	if err != nil {
+		return shim.Error("Failed to get Seller: " + err.Error())
+	}
+	if bytesAdmin == nil {
+		return shim.Error("This Admin not exists: ")
+	}
+	var admin Admin
+
+	err = json.Unmarshal(bytesAdmin, &admin)
+	if err != nil {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Admin Account \"}")
+	}
+	if admin.Password == accountPassword {
+		// ==== Check if Student exists ====
+		bytesStudent, err := stub.GetState(transaction.Student2)
+		if err != nil {
+			return shim.Error("Failed to get Student: " + err.Error())
 		}
+		if bytesStudent == nil {
+			return shim.Error("This Student not exists: ")
+		}
+		var digitalStudent Student
+		err = json.Unmarshal(bytesStudent, &digitalStudent)
+		if err != nil {
+			return shim.Error("Failed to get Student: " + err.Error())
+		}
+		// ==== Check if Point is a integer ====
+
+		// ==== Move Action ====
+
+		//digitalStudent.Point = digitalStudent.Point + transaction.Point
+
+		var s int
+		s1, err := strconv.Atoi(digitalStudent.Money)
+		s2, err := strconv.Atoi(args[2])
+		s = s1 + s2
+		digitalStudent.Money = strconv.Itoa(s) // must change into int????
+
+		DigitalStudentBytes, _ := json.Marshal(digitalStudent)
+		err = stub.PutState(transaction.Student2, []byte(DigitalStudentBytes))
+		if err != nil {
+			return shim.Error(err.Error())
+		}
+		return shim.Success([]byte("{\"Result\":\"MovePointSuccess\",\"message\":{" + args[4] + "}}"))
+	}
+	return shim.Error("\"Result\":\"fail\",\"Message\":\"Incorrect password\"")
+}
+
+func (t *SimpleChaincode) CreatCredit(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 6 {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Incorrect number of arguments. Expecting 7 \"}")
 	}
 
-	// fill endorsements
-	endorsements := make([]*pb.Endorsement, len(resps))
-	for n, r := range resps {
-		endorsements[n] = r.Endorsement
-	}
-	// create ChaincodeEndorsedAction
-	cea := &pb.ChaincodeEndorsedAction{ProposalResponsePayload: resps[0].Payload, Endorsements: endorsements}
+	var transaction Transaction
+	var err error
+	transaction.Transaction2 = args[0]
+	transaction.AdminID = args[1]
+	transaction.StudentID = args[2]
+	transaction.Money = args[3]
+	transaction.Time = args[4]
+	transaction.message = args[5]
 
-	// obtain the bytes of the proposal payload that will go to the transaction
-	propPayloadBytes, err := protos_utils.GetBytesProposalPayloadForTx(pPayl, hdrExt.PayloadVisibility)
+	// ==== Check if admin exists ====
+	bytesAdmin, err := stub.GetState(transaction.AdminID)
 	if err != nil {
-		return nil, err
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Failed to get Admin \"}")
 	}
+	if bytesAdmin == nil {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"This Admin not exists \"}")
+	}
+	var admin Admin
 
-	// get the bytes of the signature header, that will be the header of the TransactionAction
-	sHdrBytes, err := protos_utils.GetBytesSignatureHeader(hdr.SignatureHeader)
+	err = json.Unmarshal(bytesAdmin, &admin)
 	if err != nil {
-		return nil, err
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Admin Account \"}")
 	}
 
-	// serialize the chaincode action payload
-	cap := &pb.ChaincodeActionPayload{ChaincodeProposalPayload: propPayloadBytes, Action: cea}
-	capBytes, err := protos_utils.GetBytesChaincodeActionPayload(cap)
+	// ==== Check if Student exists ====
+	bytesStudent, err := stub.GetState(transaction.StudentID)
 	if err != nil {
-		return nil, err
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Student\"}")
+	}
+	if bytesStudent == nil {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Student Account\"}")
+	}
+	var student Student
+
+	err = json.Unmarshal(bytesStudent, &student)
+	if err != nil {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Account \"" + err.Error() + "\"}")
+	}
+	// ==== Check if Point is a integer ====
+
+	// ==== Move Action ====
+	/*var s int
+	s1, err := strconv.Atoi(student.Money)
+	if err != nil {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Not number\"}")
+	}
+	s2, err1 := strconv.Atoi(args[4])
+	if err1 != nil {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Not number\"}")
+	}
+	s = s1 + s2
+	student.Money = strconv.Itoa(s) // must change into int????
+	DigitalStudentBytes, _ := json.Marshal(student)
+	err = stub.PutState(transaction.StudentID, []byte(DigitalStudentBytes))
+	if err != nil {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Student ID\"" + err.Error() + "\"}")
+	}
+	//return shim.Success([]byte("Success move point"))
+	*/
+	// ======Creat train Message=========
+	DigitaltransactionBytes, _ := json.Marshal(transaction)
+	bytes, err := stub.GetState(transaction.Transaction2)
+	if err != nil {
+		return shim.Error("Failed to get transaction: " + err.Error())
+	}
+	if bytes == nil {
+
 	}
 
-	// create a transaction
-	taa := &pb.TransactionAction{Header: sHdrBytes, Payload: capBytes}
-	taas := make([]*pb.TransactionAction, 1)
-	taas[0] = taa
-	tx := &pb.Transaction{Actions: taas}
+	err = stub.PutState(transaction.Transaction2, []byte(DigitaltransactionBytes))
+	if err != nil {
+		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to creat Transaction Message\"}")
+	}
+	return shim.Success([]byte("{\"Result\":\"CreatCrditsuccess\",\"Message\":\"Success to creat Transaction Message\"}"))
 
-	return tx, nil
+	return shim.Error("{\"Result\":\"fail\",\"Message\":\"Wrong Password\"}")
 
 }
 
-// SendTransaction ...
-/**
- * Send a transaction to the chain’s orderer service (one or more orderer endpoints) for consensus and committing to the ledger.
- * This call is asynchronous and the successful transaction commit is notified via a BLOCK or CHAINCODE event. This method must provide a mechanism for applications to attach event listeners to handle “transaction submitted”, “transaction complete” and “error” events.
- * Note that under the cover there are two different kinds of communications with the fabric backend that trigger different events to
- * be emitted back to the application’s handlers:
- * 1-)The grpc client with the orderer service uses a “regular” stateless HTTP connection in a request/response fashion with the “broadcast” call.
- * The method implementation should emit “transaction submitted” when a successful acknowledgement is received in the response,
- * or “error” when an error is received
- * 2-)The method implementation should also maintain a persistent connection with the Chain’s event source Peer as part of the
- * internal event hub mechanism in order to support the fabric events “BLOCK”, “CHAINCODE” and “TRANSACTION”.
- * These events should cause the method to emit “complete” or “error” events to the application.
- */
-func (c *Chain) SendTransaction(proposal *pb.Proposal, tx *pb.Transaction) (map[string]*TransactionResponse, error) {
-	if c.orderers == nil || len(c.orderers) == 0 {
-		return nil, fmt.Errorf("orderers is nil")
-	}
-	if proposal == nil {
-		return nil, fmt.Errorf("proposal is nil")
-	}
-	if tx == nil {
-		return nil, fmt.Errorf("Transaction is nil")
-	}
-	// the original header
-	hdr, err := protos_utils.GetHeader(proposal.Header)
-	if err != nil {
-		return nil, fmt.Errorf("Could not unmarshal the proposal header")
-	}
-	// serialize the tx
-	txBytes, err := protos_utils.GetBytesTransaction(tx)
-	if err != nil {
-		return nil, err
+//=============================================================================================
+//删除学生
+//args: ID
+//=============================================================================================
+func (t *SimpleChaincode) DeleteStudent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	fmt.Println("DeleteAccount")
+
+	if len(args) != 1 {
+		return shim.Error("Incorrect number of arguments. Expecting 1")
 	}
 
-	// create the payload
-	payl := &common.Payload{Header: hdr, Data: txBytes}
-	paylBytes, err := protos_utils.GetBytesPayload(payl)
+	accountID := args[0]
+	bytes, err := stub.GetState(accountID)
 	if err != nil {
-		return nil, err
+		return shim.Error("Failed to get account: " + err.Error())
+	}
+	if bytes == nil {
+		return shim.Error("this account is not found")
 	}
 
-	cryptoSuite := c.clientContext.GetCryptoSuite()
-	digest, err := cryptoSuite.Hash(paylBytes, &bccsp.SHAOpts{})
+	var student Student
+	err = json.Unmarshal(bytes, &student)
 	if err != nil {
-		return nil, err
+		return shim.Error("Failed to get account: " + err.Error())
 	}
-	user, err := c.clientContext.GetUserContext("")
+
+	student = Student{} //delete the struct
+	bytes, err = json.Marshal(student)
 	if err != nil {
-		return nil, fmt.Errorf("GetUserContext return error: %s\n", err)
+		return shim.Error(err.Error())
 	}
-	signature, err := cryptoSuite.Sign(user.GetPrivateKey(),
-		digest, nil)
+	err = stub.PutState(accountID, bytes)
+
+	err = stub.DelState(accountID)
 	if err != nil {
-		return nil, err
+		return shim.Error("Failed to delete state:" + err.Error())
 	}
-	// here's the envelope
-	envelope := &common.Envelope{Payload: paylBytes, Signature: signature}
-
-	transactionResponseMap := make(map[string]*TransactionResponse)
-	var wg sync.WaitGroup
-	for _, o := range c.orderers {
-		wg.Add(1)
-		go func(orderer *Orderer, wg *sync.WaitGroup, trm map[string]*TransactionResponse) {
-			defer wg.Done()
-			var err error
-			var transactionResponse *TransactionResponse
-
-			logger.Debugf("Send TransactionRequest to orderer :%s\n", orderer.GetURL())
-			if err = orderer.SendBroadcast(envelope); err != nil {
-				logger.Debugf("Receive Error Response from orderer :%v\n", err)
-				transactionResponse = &TransactionResponse{orderer.GetURL(), fmt.Errorf("Error calling endorser '%s':  %s", orderer.GetURL(), err)}
-			} else {
-				logger.Debugf("Receive Success Response from orderer\n")
-				transactionResponse = &TransactionResponse{orderer.GetURL(), nil}
-			}
-			trm[transactionResponse.Orderer] = transactionResponse
-		}(o, &wg, transactionResponseMap)
+	bytes, err = stub.GetState(accountID)
+	if err != nil {
+		return shim.Success([]byte("{\"delete \":\"delete sucessful\"}"))
 	}
-	wg.Wait()
-	return transactionResponseMap, nil
 
+	return shim.Success([]byte("{\"delete \":\"delete sucessful\"}")) //
 }
 
-func main() {}
+//=============================================================================================
+//删除学生
+//args: ID
+//=============================================================================================
+func (t *SimpleChaincode) DeleteAdmin(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	fmt.Println("DeleteAccount")
+
+	if len(args) != 1 {
+		return shim.Error("Incorrect number of arguments. Expecting 1")
+	}
+
+	accountID := args[0]
+	bytes, err := stub.GetState(accountID)
+	if err != nil {
+		return shim.Error("Failed to get account: " + err.Error())
+	}
+	if bytes == nil {
+		return shim.Error("this account is not found")
+	}
+
+	var admin Admin
+	err = json.Unmarshal(bytes, &admin)
+	if err != nil {
+		return shim.Error("Failed to get account: " + err.Error())
+	}
+
+	admin = Admin{} //delete the struct
+	bytes, err = json.Marshal(admin)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	err = stub.PutState(accountID, bytes)
+
+	err = stub.DelState(accountID)
+	if err != nil {
+		return shim.Error("Failed to delete state:" + err.Error())
+	}
+	bytes, err = stub.GetState(accountID)
+	if err != nil {
+		return shim.Success([]byte("{\"delete \":\"delete sucessful\"}"))
+	}
+
+	return shim.Success([]byte("{\"delete \":\"delete sucessful\"}"))
+}
+
+//================
+//验证Student账号密码是否匹配 args:ID|Password
+//================
+func (t *SimpleChaincode) loginStudent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+
+	if len(args) != 2 {
+		return shim.Error("Incorrect number of arguments. Expecting 2")
+	}
+
+	accountID := args[0]
+	password := args[1]
+
+	//query the ledger
+	bytes, err := stub.GetState(accountID)
+	if err != nil {
+		return shim.Error("Failed to get account: " + err.Error())
+	}
+	if bytes == nil {
+		return shim.Error("This account does not exists: " + accountID)
+	}
+	var student Student
+	err = json.Unmarshal(bytes, &student)
+	if err != nil {
+		return shim.Error("Failed to get Student account: " + err.Error())
+	}
+	if student.Password == password {
+		return shim.Success([]byte("{\"login\":\"loginSuccess\"}"))
+	} else {
+		return shim.Error("{\"login\":\"wrong password\"}")
+	}
+}
+
+//================
+//验证Admin账号密码是否匹配 args:ID|Password
+//================
+func (t *SimpleChaincode) loginAdmin(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+
+	if len(args) != 2 {
+		return shim.Error("Incorrect number of arguments. Expecting 2")
+	}
+	accountID := args[0]
+	password := args[1]
+
+	//query the ledger
+	bytes, err := stub.GetState(accountID)
+	if err != nil {
+		return shim.Error("Failed to get account: " + err.Error())
+	}
+	if bytes == nil {
+		return shim.Error("This account does not exists: " + accountID)
+	}
+	var admin Admin
+	err = json.Unmarshal(bytes, &admin)
+	if err != nil {
+		return shim.Error("Failed to get admin account: " + err.Error())
+	}
+	if admin.Password == password {
+		return shim.Success([]byte("{\"login\":\"loginSuccess\"}"))
+	} else {
+		return shim.Error("{\"login\":\"wrong password\"}")
+	}
+}
+
+func (t *SimpleChaincode) getHistoryForKey(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 1 {
+		return shim.Error("Incorrect number of arguments. Expecting 2,function followed by 1 accountID and 1 value")
+	}
+
+	var accountID string //Entities
+	var err error
+	accountID = args[0]
+	//Get the state from the ledger
+	//TODD:will be nice to have a GetAllState call to ledger
+	HisInterface, err := stub.GetHistoryForKey(accountID)
+	fmt.Println(HisInterface)
+	Avalbytes, err := getHistoryListResult(HisInterface)
+	if err != nil {
+		return shim.Error("Failed to get history")
+	}
+	return shim.Success([]byte(Avalbytes))
+}
+
+func getHistoryListResult(resultsIterator shim.HistoryQueryIteratorInterface) ([]byte, error) {
+
+	defer resultsIterator.Close()
+	// buffer is a JSON array containing QueryRecords
+	var buffer bytes.Buffer
+	buffer.WriteString("[")
+
+	bArrayMemberAlreadyWritten := false
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+		// Add a comma before array members, suppress it for the first array member
+		if bArrayMemberAlreadyWritten == true {
+			buffer.WriteString(",")
+		}
+		item, _ := json.Marshal(queryResponse)
+		buffer.Write(item)
+		bArrayMemberAlreadyWritten = true
+	}
+	buffer.WriteString("]")
+	fmt.Printf("queryResult:\n%s\n", buffer.String())
+	return buffer.Bytes(), nil
+}
+
+//=======================================================================================
+//main function
+//=================================================================================
+func main() {
+	err := shim.Start(new(SimpleChaincode))
+	if err != nil {
+		fmt.Printf("Error starting Simple chaincode: %s", err)
+	}
+}
