@@ -1,695 +1,816 @@
 package main
 
 import (
-	"bytes"
-	"crypto/x509"
-	"encoding/json"
-	"encoding/pem"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric/core/chaincode/lib/cid"
+	"crypto/sha256"
+	"math/big"
+
+	//"crypto/ecdsa"
+	"crypto/elliptic"
+
+	"encoding/json"
+	//"encoding/binary"
+	//"gonum.org/v1/gonum/mat"
+	//"math"
+
+	gf "github.com/cloud9-tools/go-galoisfield"
 	"github.com/hyperledger/fabric/core/chaincode/shim"
-	mspprotos "github.com/hyperledger/fabric/protos/msp"
-	sc "github.com/hyperledger/fabric/protos/peer"
+	"github.com/hyperledger/fabric/protos/peer"
+
+	"github.com/gonum/stat/combin"
 )
 
-var logger = shim.NewLogger("example_cc0")
+var (
+	curve = elliptic.P256()
+)
 
-type SmartContract struct {
-}
+const (
+	consortiumName = "RAPDEL"
+)
 
-type workspace struct {
-	Wtype            string           `json:"WorksapceType"`
-	PhysicalLocation physicalLocation `json:"physicalLocation"`
-	Furnitures       []furniture      `json:"furniture"`
-	EAsset           electricalAsset  `json:electricalAsset`
-	NetAsset         networkAsset     `json:"networkAsset"`
-	Requests         []WSpaceSchedule `json:"requests"`
-	Schedule         []WSpaceSchedule `json:"schedule"`
-}
-type WSpaceSchedule struct {
-	ScheduleId string `json:"schedleId"`
-	UserId     string `json:"UserID"`
-}
-type physicalLocation struct {
-	Country       string `json:"country"`
-	City          string `json:"city"`
-	BuildingName  string `json:buildingName`
-	Floor         string `json:"floor"`
-	Wing          string `json:"wing"`
-	WorkSpaceName string `json:"wspaceName"`
-}
+// ************************
+func Combine(shares map[byte][]byte) []byte {
+	var secret []byte
+	for _, v := range shares {
+		secret = make([]byte, len(v))
+		break
+	}
 
-type furniture struct {
-	Fname    string `json:"fname"`
-	Quantity string `json:"quantity"`
+	points := make([]pair, len(shares))
+	for i := range secret {
+		p := 0
+		for k, v := range shares {
+			points[p] = pair{x: k, y: v[i]}
+			p++
+		}
+		secret[i] = interpolate(points, 0)
+	}
+
+	return secret
 }
 
-type electricalAsset struct {
-	Switches []switchs
+type pair struct {
+	x, y byte
 }
 
-type switchs struct {
-	SwitchID         string `json:"switchID"`
-	SwitchAssignedTo string `json:"switchAssignedTo"`
-	Status           string `json:"Status"`
+// Lagrange interpolation
+func interpolate(points []pair, x byte) (value byte) {
+	for i, a := range points {
+		weight := byte(1)
+		for j, b := range points {
+			if i != j {
+				top := x ^ b.x
+				bottom := a.x ^ b.x
+				factor := div(top, bottom)
+				weight = mul(weight, factor)
+			}
+		}
+		//fmt.Printf("W: %d\n", weight)
+		value = value ^ mul(weight, a.y)
+	}
+	return
 }
 
-type networkAsset struct {
-	IpPorts   []ipPortsConfig `json:"ipports"`
-	Telephone telePortsConfig `json:"telePorts"`
+func mul(e, a byte) byte {
+	// campo
+	campo := gf.Poly84320_g2
+	return campo.Mul(e, a)
 }
 
-type ipPortsConfig struct {
-	PortNo          string `json:"ipportNo"`
-	ConfigurationID string `json:"configID"`
-}
-type telePortsConfig struct {
-	Extension_Number string `json:"telePhoneNo"`
-	Organization     string `json:"org"`
+func div(e, a byte) byte {
+	// campo
+	campo := gf.Poly84320_g2
+	return campo.Div(e, a)
 }
 
-type config struct {
-	Org           string   `json:"org"`
-	RestrictedIP  []string `json:"restrictedIP"`
-	Gateway       string   `json:"gateway"`
-	Netmask       string   `json:"netMask"`
-	WhiteList     []string `json:"whiteList"`
-	BlackList     []string `json:"blackList"`
-	DNS_Primary   string   `json:"DNS_Primary"`
-	DNS_Secondary string   `json:"DNS_Secondary"`
+// ************************
+
+type Theorem struct {
+	X     string
+	Y     string
+	Count int
 }
 
-type user struct {
-	FirstName string         `json:"fname"`
-	LastName  string         `json:"lastName"`
-	Age       string         `json:"age"`
-	EmailID   string         `json:"emailID"`
-	Org       string         `json:"org"`
-	Calendar  []UserSchedule `json:"calander"`
-	Policy    []policy       `json:"policy"`
+func (t *Theorem) getChallenge(p *Proof) *big.Int {
+	concat := t.getConcat4SHA() + p.getConcat4SHA()
+	c := sha256.Sum256([]byte(concat))
+	c_Int := new(big.Int).SetBytes(c[:])
+
+	return c_Int
 }
 
-type UserSchedule struct {
-	ScheduleId  string `json:"scheduleID"`
-	WorkSpaceId string `json:"wrkSpaceID"`
+func (t *Theorem) getCount() int {
+	return t.Count
 }
 
-type schedule struct {
-	StartTime     int    `json:"startTime"`
-	EndTime       int    `json:"endTime"`
-	BookingTime   int    `json:"bookingTime"`
-	BookingStatus string `json:"bookStatus"`
-	OccupiedTxID  string `json:"occupiedTxID"`
-	BookingTxID   string `json:BookingTxID`
+func (t *Theorem) verify(p *Proof) bool {
+	X, _ := new(big.Int).SetString(t.X, 10)
+	Y, _ := new(big.Int).SetString(t.Y, 10)
+
+	acX, acY := curve.ScalarMult(X, Y, p.C.Bytes())
+	grX, grY := curve.ScalarBaseMult(p.R.Bytes())
+	testX, testY := curve.Add(grX, grY, acX, acY)
+
+	if !(testX.Cmp(p.V.X) == 0 && testY.Cmp(p.V.Y) == 0) {
+		return false
+	}
+	t.increment()
+	return true
 }
 
-type policy struct {
-	WhiteList   []string `json:"userwhitelist"`
-	BlackList   []string `json:"blackList"`
-	PermittedIP []string `json:"permittedIP"`
+func (t *Theorem) getConcat4SHA() string {
+	return fmt.Sprintf("%s%s%d", t.X, t.Y, t.Count)
 }
 
-type IDs struct {
-	CubicleID  string `json:"cubID"`
-	RoomID     string `json:"roomID"`
-	ConfRoomID string `json:"confRoomID"`
-	BookingId  string `json:"BookingId"`
+func (t *Theorem) String() string {
+	valueAsBytes, _ := json.Marshal(*t)
+	return string(valueAsBytes)
+}
+
+func (t *Theorem) increment() {
+	//t.Count++
+}
+
+func theoremFromBytes(jsonByte []byte) *Theorem {
+	res := &Theorem{}
+	err := json.Unmarshal(jsonByte, res)
+	if err != nil {
+		return nil
+	}
+	return res
+}
+
+type Proof struct {
+	C, R *big.Int
+	V    struct{ X, Y *big.Int }
+	Once string
+}
+
+func (p *Proof) getConcat4SHA() string {
+	return fmt.Sprintf("%s%s%s", p.V.X.String(), p.V.Y.String(), p.Once)
+}
+
+func (p *Proof) verifyChallenge(t *Theorem) bool {
+	c := t.getChallenge(p)
+	return (p.C.Cmp(c) == 0)
+}
+
+func proofFromBytes(jsonByte []byte) *Proof {
+	res := &Proof{}
+	err := json.Unmarshal(jsonByte, res)
+	if err != nil {
+		return nil
+	}
+	return res
+}
+
+func proofsFromBytes(jsonByte []byte) []*Proof {
+	res := []*Proof{}
+	err := json.Unmarshal(jsonByte, &res)
+	if err != nil {
+		return nil
+	}
+	return res
+}
+
+type CollectionTheorem struct {
+	Companies []*Company
+	K         int
+}
+
+func (t *CollectionTheorem) verify(p []*Proof) bool {
+	if len(p) != len(t.Companies) {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		if !(t.Companies[i].Th.verify(p[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+func (t *CollectionTheorem) String() string {
+	valueAsBytes, _ := json.Marshal(*t)
+	return string(valueAsBytes)
+}
+
+func (t *CollectionTheorem) increment() {
+	for i := 0; i < len(t.Companies); i++ {
+		t.Companies[i].Th.increment()
+	}
+}
+
+func (t *CollectionTheorem) getCount(i int) int {
+	if i > len(t.Companies) || i < 0 {
+		return -1
+	}
+	return t.Companies[i].Th.getCount()
+}
+
+func (t *CollectionTheorem) verifySharing(p []*Proof, c *big.Int, k int) bool {
+	if len(p) <= 0 {
+		return false
+	}
+	degree := k + 1
+	var j byte
+	mat := combin.Combinations(len(p), degree)
+	for i := 0; i < len(mat); i++ {
+		shares := make(map[byte][]byte, degree)
+		for j = 0; int(j) < degree; j++ {
+			shares[byte(mat[i][j]+1)] = p[mat[i][j]].C.Bytes()
+		}
+		challengeCombined := Combine(shares)
+		c_Int := new(big.Int).SetBytes(challengeCombined)
+		if c.Cmp(c_Int) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+type Route struct {
+	RouteID   string
+	CompanyID string
+	Stops     []string
+	Km        float64
+	Price     float64
+	PriceMin  float64
+	PriceMax  float64
+}
+
+func (r *Route) changeOwner(company string) {
+	r.CompanyID = company
+}
+
+func (t *Route) changePrice(c float64) bool {
+	if c > t.PriceMax || c < t.PriceMin {
+		return false
+	}
+	t.Price = c
+	return true
+}
+
+func (t *Route) isEqual(t2 *Route) bool {
+	if len(t.Stops) != len(t2.Stops) {
+		return false
+	}
+	if len(t.Stops) == 0 {
+		return true
+	}
+	if strings.Compare(t.Stops[0], t2.Stops[0]) != 0 {
+		return false
+	}
+	if strings.Compare(t.Stops[len(t.Stops)-1], t2.Stops[len(t.Stops)-1]) != 0 {
+		return false
+	}
+	return true
+}
+
+func newRoute(RouteID, CompanyID string, Stops []string, Km, Price, PriceMin, PriceMax float64) *Route {
+	if Price < PriceMin || Price > PriceMax {
+		return nil
+	}
+	if len(Stops) < 1 {
+		return nil
+	}
+	if len(CompanyID) <= 3 {
+		return nil
+	}
+	return &Route{RouteID, CompanyID, Stops, Km, Price, PriceMin, PriceMax}
+}
+
+type Company struct {
+	Name   string
+	Th     *Theorem
+	Routes []string
+}
+
+func (c *Company) assignRoute(route string) {
+	c.Routes = append(c.Routes, route)
+}
+
+func (c *Company) isEqual(name string) bool {
+	return (strings.Compare(c.Name, name) == 0)
+}
+
+func (c *Company) changeName(name string, p *Proof) bool {
+	if strings.Compare(name, "") == 0 {
+		return false
+	}
+	if !c.Th.verify(p) {
+		return false
+	}
+	c.Name = name
+	return true
+}
+
+func (c *Company) String() string {
+	valueAsBytes, _ := json.Marshal(*c)
+	return string(valueAsBytes)
+}
+
+type Consortium struct {
+	//Companies		[]*Company
+	*CollectionTheorem
+	Routes []*Route
+}
+
+func (c *Consortium) addRoute(r *Route, proofs []*Proof) bool {
+	if !c.verify(proofs) {
+		return false
+	}
+	for i := 0; i < len(c.Routes); i++ {
+		if c.Routes[i].isEqual(r) {
+			return false
+		}
+	}
+	c.Routes = append(c.Routes, r)
+	for i := 0; i < len(c.Companies); i++ {
+		if c.Companies[i].isEqual(r.CompanyID) {
+			c.Companies[i].assignRoute(r.RouteID)
+		}
+	}
+	return true
+}
+
+func (c *Consortium) changeCost(routeId string, newPrice float64, proof *Proof) bool {
+	if newPrice <= 0 {
+		return false
+	}
+
+	for i := 0; i < len(c.Routes); i++ {
+		if strings.Compare(c.Routes[i].RouteID, routeId) == 0 {
+			cName := c.Routes[i].CompanyID
+			for j := 0; j < len(c.Companies); j++ {
+				if c.Companies[i].isEqual(cName) && c.Companies[i].Th.verify(proof) {
+					return c.Routes[i].changePrice(newPrice)
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (c *Consortium) changeOwnerRoute(newOwner, routeId string, proofs []*Proof) bool {
+	if !c.verify(proofs) {
+		return false
+	}
+
+	var route *Route
+	route = nil
+	for i := 0; i < len(c.Routes) && (route == nil); i++ {
+		if strings.Compare(c.Routes[i].RouteID, routeId) == 0 {
+			route = c.Routes[i]
+		}
+	}
+
+	if route == nil {
+		return false
+	}
+
+	flag := false
+	for i := 0; i < len(c.Companies) && !flag; i++ {
+		if c.Companies[i].isEqual(newOwner) {
+			flag = !flag
+		}
+	}
+
+	if !flag {
+		return false
+	}
+
+	if !c.verify(proofs) {
+		return false
+	}
+
+	route.CompanyID = newOwner
+	return true
+}
+
+func (c *Consortium) getAllRoutes() string {
+	routes := make([]*Route, len(c.Routes))
+	for i := 0; i < len(c.Routes); i++ {
+		routes[i] = c.Routes[i]
+	}
+	valueAsBytes, _ := json.Marshal(routes)
+	return string(valueAsBytes)
+}
+
+func (c *Consortium) getRoutesByCompany(companyId string) string {
+	var routes []*Route
+	for i := 0; i < len(c.Routes); i++ {
+		if strings.Compare(c.Routes[i].CompanyID, companyId) == 0 {
+			routes = append(routes, c.Routes[i])
+		}
+	}
+	valueAsBytes, _ := json.Marshal(routes)
+	return string(valueAsBytes)
+}
+
+func (c *Consortium) getRoutesByID(routeID string) string {
+	var routes []*Route
+	for i := 0; i < len(c.Routes); i++ {
+		if strings.Compare(c.Routes[i].RouteID, routeID) == 0 {
+			routes = append(routes, c.Routes[i])
+		}
+	}
+	valueAsBytes, _ := json.Marshal(routes)
+	return string(valueAsBytes)
+}
+
+func (c *Consortium) getAllCompany() string {
+	companies := make([]*Company, len(c.Companies))
+	for i := 0; i < len(c.Companies); i++ {
+		companies[i] = c.Companies[i]
+	}
+	valueAsBytes, _ := json.Marshal(companies)
+	return string(valueAsBytes)
+}
+
+func (c *Consortium) getCompany(companyID string) string {
+	for i := 0; i < len(c.Companies); i++ {
+		if strings.Compare(c.Companies[i].Name, companyID) == 0 {
+			return c.Companies[i].String()
+		}
+	}
+	return ""
+}
+
+func (c *Consortium) String() string {
+	valueAsBytes, _ := json.Marshal(*c)
+	return string(valueAsBytes)
+}
+
+func consortiumFromBytes(jsonByte []byte) *Consortium {
+	res := &Consortium{}
+	err := json.Unmarshal(jsonByte, res)
+	if err != nil {
+		return nil
+	}
+	return res
 }
 
 type Response struct {
-	RestrictedSites  []string `json:"restrictedSites"`
-	RestrictedIP     []string `json:"restrictedIP"`
-	Extension_Number string   `json:"extensionNumber"`
-	SwitchID         string   `json:"switchID"`
+	Info    string
+	IsError bool
 }
 
-func (s *SmartContract) Invoke(APIstub shim.ChaincodeStubInterface) sc.Response {
-	logger.Info("-------------------Invoke----------")
-	// Retrieve the requested Smart Contract function and arguments
-	function, args := APIstub.GetFunctionAndParameters()
-	// Route to the appropriate handler function to interact with the ledger appropriately
-	logger.Info("fucntion")
-	logger.Info(function)
-	logger.Info("args")
-	logger.Info(args)
-	if function == "newuser" {
-		return s.KYCRegistration(APIstub, args)
-	} else if function == "newWorkSpace" {
-		return s.CreateWorkspace(APIstub)
-	} else if function == "queryWorkspace" {
-		return s.QueryWorkspace(APIstub, args)
-	} else if function == "createConfig" {
-		return s.CreateConfig(APIstub)
-	} else if function == "bookWorkSpace" {
-		return s.BookWorkspace(APIstub)
-	} else if function == "ApproveOrDeny" {
-		return s.ApproveOrDeny(APIstub, args)
-	} else if function == "occupyWorkSpace" {
-		return s.OccupyWorkSpace(APIstub, args)
-	} else if function == "query" {
-		return s.QueryAllschedules(APIstub, args)
-	} else if function == "switching" {
-		return s.Switching(APIstub, args)
+func (c *Response) String() string {
+	valueAsBytes, _ := json.Marshal(*c)
+	return string(valueAsBytes)
+}
+
+func responseFromBytes(jsonByte []byte) *Response {
+	res := &Response{}
+	err := json.Unmarshal(jsonByte, res)
+	if err != nil {
+		return nil
+	}
+	return res
+}
+
+type Asset struct {
+}
+
+func (a *Asset) get(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+	valueAsBytes, err := stub.GetState(args[0])
+
+	t := &Theorem{}
+	err = json.Unmarshal(valueAsBytes, t)
+	if err != nil {
+		res.Info = fmt.Sprintf("Non so fare una get %v", err)
+		res.IsError = true
+		return res.String()
 	}
 
-	return shim.Error("Invalid Smart Contract function name.")
+	res.Info = t.X
+	res.IsError = false
+	return res.String()
 }
-func (s *SmartContract) Init(APIstub shim.ChaincodeStubInterface) sc.Response {
-	fmt.Println("-----------Instantiating---------------------------")
-	id := []IDs{
-		IDs{CubicleID: "Cubicle101", RoomID: "Room101", ConfRoomID: "ConfRoom101", BookingId: "1001"},
+
+// per ora il consorzio è unico
+func (a *Asset) addNewRoute(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+
+	if len(args) != 8 {
+		res.IsError = true
+		res.Info = "Incorrect arguments. Expecting 'IdRoute, IdCompany, Stops, Km, Price, PriceMin, PriceMax, []Proof'\n"
+		return res.String()
+	}
+	consortiumAsByte, errCons := stub.GetState(consortiumName)
+	if errCons != nil || len(consortiumAsByte) == 0 {
+		res.IsError = true
+		res.Info = "Consortium not Found!"
+		return res.String()
+	}
+	cons := consortiumFromBytes(consortiumAsByte)
+
+	idRoute := args[0]
+	compName := args[1]
+	stops := []string{}
+	errP1 := json.Unmarshal([]byte(args[2]), &stops)
+	km, errC1 := strconv.ParseFloat(args[3], 64)
+	price, errC2 := strconv.ParseFloat(args[4], 64)
+	priceMin, errC3 := strconv.ParseFloat(args[5], 64)
+	priceMax, errC4 := strconv.ParseFloat(args[6], 64)
+	proofs := proofsFromBytes([]byte(args[7]))
+	if errP1 != nil || errC1 != nil || errC2 != nil || errC3 != nil || errC4 != nil || proofs == nil {
+		res.IsError = true
+		res.Info = "Parsing error"
+		return res.String()
 	}
 
-	idsAsBytes, _ := json.Marshal(id[0])
-	APIstub.PutState("ids", idsAsBytes)
+	newRoute := newRoute(idRoute, compName, stops, km, price, priceMin, priceMax)
+	if newRoute == nil {
+		res.IsError = true
+		res.Info = "Route is not valid"
+		return res.String()
+	}
 
-	return shim.Success(nil)
+	if !cons.addRoute(newRoute, proofs) {
+		res.IsError = true
+		res.Info = "ZKP is not valid OR Route already exists."
+		return res.String()
+	}
+
+	_ = stub.PutState(consortiumName, []byte(cons.String()))
+	res.IsError = false
+	res.Info = "Route is successfully registered"
+	return res.String()
 }
 
-func (s *SmartContract) KYCRegistration(stub shim.ChaincodeStubInterface, args []string) sc.Response {
+//implementare ZKP
+func (a *Asset) changeCost(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+	if len(args) != 3 {
+		res.IsError = true
+		res.Info = "Incorrect arguments. Expecting 'RouteId, Price, Proof"
+		return res.String()
+	}
+	consortiumAsByte, errCons := stub.GetState(consortiumName)
+	cons := consortiumFromBytes(consortiumAsByte)
+	if errCons != nil || len(consortiumAsByte) == 0 || cons == nil {
+		res.IsError = true
+		res.Info = "Consortium not found"
+		return res.String()
+	}
 
-	logger.Info("########### KYCRegistration ###########")
+	routeId := args[0]
+	newPrice, errP1 := strconv.ParseFloat(args[1], 64)
+	proof := proofFromBytes([]byte(args[2]))
+	if errP1 != nil || proof == nil {
+		res.IsError = true
+		res.Info = "Bad arguments."
+		return res.String()
+	}
 
-	creator, err := stub.GetCreator()
+	if !cons.changeCost(routeId, newPrice, proof) {
+		res.IsError = true
+		res.Info = "ZKP or price is not valid"
+		return res.String()
+	}
+	_ = stub.PutState(consortiumName, []byte(cons.String()))
+	res.IsError = false
+	res.Info = "Price is successfully changed."
+	return res.String()
+}
+
+//implementare (k,n) ZKP
+func (a *Asset) changeOwner(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+	if len(args) != 3 {
+		res.IsError = true
+		res.Info = "Incorrect arguments. Expecting 'NewOwner, routeID, []Proof'"
+		return res.String()
+	}
+	consortiumAsByte, errCons := stub.GetState(consortiumName)
+	cons := consortiumFromBytes(consortiumAsByte)
+	if errCons != nil || len(consortiumAsByte) == 0 || cons == nil {
+		res.IsError = true
+		res.Info = "Consortium not found"
+		return res.String()
+	}
+
+	newOwner := args[0]
+	routeId := args[1]
+	proofs := proofsFromBytes([]byte(args[2]))
+	if len(routeId) < 3 || len(newOwner) < 3 || proofs == nil {
+		res.IsError = true
+		res.Info = "Bad arguments."
+		return res.String()
+	}
+	if !cons.changeOwnerRoute(newOwner, routeId, proofs) {
+		res.IsError = true
+		res.Info = "ZKP or Owner is not valid."
+		return res.String()
+	}
+
+	_ = stub.PutState(consortiumName, []byte(cons.String()))
+	res.IsError = false
+	res.Info = "Owner is successfully changed."
+	return res.String()
+}
+
+func (a *Asset) getCompany(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+	if len(args) != 1 {
+		res.IsError = true
+		res.Info = "Incorrect arguments. Expecting 'CompanyID'"
+		return res.String()
+	}
+
+	consortiumAsByte, errCons := stub.GetState(consortiumName)
+	cons := consortiumFromBytes(consortiumAsByte)
+	if errCons != nil || len(consortiumAsByte) == 0 || cons == nil {
+		res.IsError = true
+		res.Info = "Consortium not found"
+		return res.String()
+	}
+	res.Info = cons.getCompany(args[0])
+	res.IsError = false
+	return res.String()
+}
+
+func (a *Asset) getAllCompany(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+	if len(args) != 0 {
+		res.IsError = true
+		res.Info = "Incorrect arguments. Expecting 'Nothing.'"
+		return res.String()
+	}
+
+	consortiumAsByte, errCons := stub.GetState(consortiumName)
+	cons := consortiumFromBytes(consortiumAsByte)
+	if errCons != nil || len(consortiumAsByte) == 0 || cons == nil {
+		res.IsError = true
+		res.Info = fmt.Sprintf("Consortium not found %t, %t, %t \n\n %s", errCons != nil, len(consortiumAsByte) == 0, cons == nil, cons)
+		return res.String()
+	}
+	res.Info = cons.getAllCompany()
+	res.IsError = false
+	return res.String()
+}
+
+func (a *Asset) getAllRoutes(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+	if len(args) != 0 {
+		res.IsError = true
+		res.Info = "Incorrect arguments. Expecting Nothing"
+		return res.String()
+	}
+
+	consortiumAsByte, errCons := stub.GetState(consortiumName)
+	cons := consortiumFromBytes(consortiumAsByte)
+	if errCons != nil || len(consortiumAsByte) == 0 || cons == nil {
+		res.IsError = true
+		res.Info = "Consortium not found"
+		return res.String()
+	}
+	res.Info = cons.getAllRoutes()
+	res.IsError = false
+	return res.String()
+}
+
+func (a *Asset) getRoutesByCompany(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+	if len(args) != 1 {
+		res.IsError = true
+		res.Info = "Incorrect arguments. Expecting 'CompanyID'"
+		return res.String()
+	}
+
+	consortiumAsByte, errCons := stub.GetState(consortiumName)
+	cons := consortiumFromBytes(consortiumAsByte)
+	if errCons != nil || len(consortiumAsByte) == 0 || cons == nil {
+		res.IsError = true
+		res.Info = "Consortium not found"
+		return res.String()
+	}
+	res.Info = cons.getRoutesByCompany(args[0])
+	res.IsError = false
+	return res.String()
+}
+
+func (a *Asset) getRouteByID(stub shim.ChaincodeStubInterface, args []string) string {
+	res := &Response{}
+	if len(args) != 1 {
+		res.IsError = true
+		res.Info = "Incorrect arguments. Expecting 'RouteID'"
+		return res.String()
+	}
+
+	consortiumAsByte, errCons := stub.GetState(consortiumName)
+	cons := consortiumFromBytes(consortiumAsByte)
+	if errCons != nil || len(consortiumAsByte) == 0 || cons == nil {
+		res.IsError = true
+		res.Info = "Consortium not found"
+		return res.String()
+	}
+	res.Info = cons.getRoutesByID(args[0])
+	res.IsError = false
+	return res.String()
+}
+
+/*
+func (a *Asset) Query(stub shim.ChaincodeStubInterface) (peer.Response) {
+	fn, args := stub.GetFunctionAndParameters()
+
+	var result string
+	var err error
+
+	switch fn {
+	case "getCompanies":
+		result, err = a.getAllCompany(stub, args)
+	case "getCompany":
+		result, err = a.getCompany(stub, args)
+	case "getRoutes":
+		result, err = a.getAllRoutes(stub, args)
+	case "getRouteByID":
+		result, err = a.getRouteByID(stub, args)
+	case "getRouteByCompany":
+		result, err = a.getRouteByCompany(stub, args)
+	default :
+		result = "Wrong request\n"
+		err = nil
+	}
+
 	if err != nil {
 		return shim.Error(err.Error())
 	}
+	return shim.Success([]byte(result))
+}
+*/
 
-	id := &mspprotos.SerializedIdentity{}
-	err = proto.Unmarshal(creator, id)
-	block, _ := pem.Decode(id.GetIdBytes())
-	cert, err := x509.ParseCertificate(block.Bytes)
-	enrollID := cert.Subject.CommonName
+func (a *Asset) Invoke(stub shim.ChaincodeStubInterface) peer.Response {
+	fn, args := stub.GetFunctionAndParameters()
 
-	userAsbytes, _ := stub.GetState(enrollID)
+	var result string
 
-	if userAsbytes != nil {
-		return shim.Error("User already exists")
+	switch fn {
+	case "changeOwner":
+		result = a.changeOwner(stub, args)
+	case "newRoute":
+		result = a.addNewRoute(stub, args)
+	case "changeCost":
+		result = a.changeCost(stub, args)
+	case "getCompanies":
+		result = a.getAllCompany(stub, args)
+	case "getCompany":
+		result = a.getCompany(stub, args)
+	case "getRoutes":
+		result = a.getAllRoutes(stub, args)
+	case "getRouteByID":
+		result = a.getRouteByID(stub, args)
+	case "getRouteByCompany":
+		result = a.getRoutesByCompany(stub, args)
+	case "debug":
+		result = a.get(stub, args)
+	default:
+		res := &Response{"Wrong request", true}
+		result = res.String()
 	}
-	fmt.Printf("enrollID: %s", enrollID)
-	mspID := id.GetMspid()
-
-	newuser := user{FirstName: args[0], LastName: args[1], Age: args[2], EmailID: args[3]}
-	newuser.Org = mspID
-	newuserAsBytes, _ := json.Marshal(newuser)
-	stub.PutState(enrollID, newuserAsBytes)
-	// fmt.Println("enrollID", enrollID)
-	fmt.Println("user object ", newuser)
-	return shim.Success(nil)
+	res := responseFromBytes([]byte(result))
+	if (res == nil) || (res.IsError) {
+		return shim.Error("InvokeError. " + res.Info)
+	}
+	return shim.Success([]byte(res.Info))
 }
 
-func (s *SmartContract) CreateWorkspace(stub shim.ChaincodeStubInterface) sc.Response {
+func (t *Asset) Init(stub shim.ChaincodeStubInterface) peer.Response {
+	t1 := theoremFromBytes([]byte("{\"X\":\"47797774575095622166547957220177615540886918239845290804264587617452038841830\",\"Y\":\"103747043514213939569165896769541903708348509212261881966094138542901652705696\",\"Count\":0}"))
+	c1 := &Company{"CSTP", t1, []string{"001"}}
+	t2 := theoremFromBytes([]byte("{\"X\":\"80131084105585640864111912269459382479697664205010398933567215811989493963576\",\"Y\":\"61745800963240875686425973289051540081218529509241748110182069939013924473700\",\"Count\":0}"))
+	c2 := &Company{"AIR", t2, []string{"002"}}
+	t3 := theoremFromBytes([]byte("{\"X\":\"94105354386433170744573323041569379091911367324661928374118087159782480035076\",\"Y\":\"30130962657130423435424259312771666160210868114607882078501420567050553202497\",\"Count\":0}"))
+	c3 := &Company{"UNIVERSAL", t3, []string{"003"}}
+	t4 := theoremFromBytes([]byte("{\"X\":\"82109354421193012560603734009935897774826969265643743864708276239906454176364\",\"Y\":\"113178912597343203632733772056074939370505761398780392252759094680229994396625\",\"Count\":0}"))
+	c4 := &Company{"SITA", t4, []string{"004"}}
+	t5 := theoremFromBytes([]byte("{\"X\":\"68327095023128296203952691150040286093932836955856906175723268885041162204786\",\"Y\":\"22384322286589943170998482170661916669727352908014803766628508425333997712835\",\"Count\":0}"))
+	c5 := &Company{"LEONETTI", t5, []string{"005"}}
+	r1 := &Route{"001", "CSTP", []string{"FISCIANO", "SALERNO"}, 12.0, 2.2, 2.0, 3.0}
+	r2 := &Route{"002", "AIR", []string{"LANCUSI", "AVELLINO"}, 28.0, 3.1, 3.0, 4.0}
+	r3 := &Route{"003", "UNIVERSAL", []string{"GRAGNANO", "FISCIANO"}, 46.0, 3.6, 3.0, 4.0}
+	r4 := &Route{"004", "SITA", []string{"AVELLINO", "MONTORO", "SALERNO"}, 35.0, 3.2, 3.0, 4.0}
+	r5 := &Route{"009", "LEONETTI", []string{"BRACIGLIANO", "SALERNO"}, 24.0, 2.8, 2.5, 3.0}
 
-	logger.Info("##################CreateWorkspace##################")
+	routes := []*Route{r1, r2, r3, r4, r5}
+	companies := []*Company{c1, c2, c3, c4, c5}
 
-	atrrValue, _, _ := cid.GetAttributeValue(stub, "Role")
-	logger.Info("Role ", atrrValue)
+	ths := &CollectionTheorem{companies, 3}
 
-	if strings.Compare(strings.ToLower(string(atrrValue)), "admin") != 0 {
-		//		logger.Info("acess denied")
-		return shim.Error("Access denied")
-	}
-	args := stub.GetArgs()
-	newWrkSpace := workspace{}
-	idsAsBytes, _ := stub.GetState("ids")
-	id := IDs{}
-	json.Unmarshal(idsAsBytes, &id)
-	key := ""
+	cons := &Consortium{ths, routes}
 
-	//------------------------------get IDS--------------------------------
-	if strings.Compare(strings.ToLower(string(args[1])), "cubicle") == 0 {
-
-		key = id.CubicleID
-		j := string([]rune(id.CubicleID)[7])
-		cubId_no, _ := strconv.Atoi(j)
-		cubId_no = cubId_no + 1
-		cubId := "Cubicle" + strconv.Itoa(cubId_no)
-		id.CubicleID = cubId
-		idsAsBytes, _ = json.Marshal(id)
-		stub.PutState("ids", idsAsBytes)
-
-	} else if strings.Compare(strings.ToLower(string(args[1])), "room") == 0 {
-		key = id.RoomID
-		j := string([]rune(id.RoomID)[4])
-		roomId_no, _ := strconv.Atoi(j)
-		roomId_no = roomId_no + 1
-		roomId := "Room" + strconv.Itoa(roomId_no)
-		id.RoomID = roomId
-		idsAsBytes, _ = json.Marshal(id)
-		stub.PutState("ids", idsAsBytes)
-	} else if strings.Compare(strings.ToLower(string(args[1])), "confroom") == 0 {
-		key = id.ConfRoomID
-		j := string([]rune(id.ConfRoomID)[8])
-		confID_no, _ := strconv.Atoi(j)
-		confID_no = confID_no + 1
-		confID := "ConfRoom" + strconv.Itoa(confID_no)
-		id.ConfRoomID = confID
-		idsAsBytes, _ = json.Marshal(id)
-		stub.PutState("ids", idsAsBytes)
-	} else {
-		shim.Error("Invlaid workspace type")
-	}
-	// ------------------------Wtype---------------
-	newWrkSpace.Wtype = string(args[1])
-	fmt.Println(string(args[1]))
-
-	// ---------------------physical location-----------------
-	physlocation := physicalLocation{}
-	pyslocAsbytes := args[2]
-
-	if err := json.Unmarshal(pyslocAsbytes, &physlocation); err != nil {
-		log.Fatal(err)
-	}
-	//	------------------------validate wether it already exists------------------
-	indexName := "location~wspID"
-	it, _ := stub.GetStateByPartialCompositeKey(indexName, []string{physlocation.Country, physlocation.City, physlocation.BuildingName, physlocation.Floor, physlocation.Wing, physlocation.WorkSpaceName})
-	defer it.Close()
-
-	_, err := it.Next()
-	if err == nil {
-
-		return shim.Error("Worksapce Already Exists")
-	}
-	newWrkSpace.PhysicalLocation = physlocation
-
-	//	----------------------------Adding composite key--------------------
-	location, _ := stub.CreateCompositeKey(indexName, []string{physlocation.Country, physlocation.City, physlocation.BuildingName, physlocation.Floor, physlocation.Wing, physlocation.WorkSpaceName, key})
-	logger.Info("composite key", location)
-	logger.Info("array :", physlocation.Country, physlocation.City, physlocation.BuildingName, physlocation.Floor, physlocation.Wing, physlocation.WorkSpaceName)
-	value := []byte{0x00}
-	stub.PutState(location, value)
-
-	// --------------------------------furnitures------------------
-	furn := []furniture{}
-	furnAsbytes := args[3]
-	if err := json.Unmarshal(furnAsbytes, &furn); err != nil {
-		log.Fatal(err)
-	}
-	newWrkSpace.Furnitures = furn
-	// -----------------------electricalAsset-------------------
-	switchArrAsBytes := args[4]
-	fmt.Println("electrical Asset ", string(args[4]))
-	var switchArrData [][]string
-	json.Unmarshal(switchArrAsBytes, &switchArrData)
-	sw := []switchs{}
-	for i := 0; i < len(switchArrData); i++ {
-
-		s := switchs{}
-		s.SwitchID = switchArrData[i][0]
-		s.SwitchAssignedTo = switchArrData[i][1]
-		s.Status = switchArrData[i][2]
-		sw = append(sw, s)
-	}
-
-	newWrkSpace.EAsset.Switches = sw
-	// --------------------------NetworkAsset-------------------
-	fmt.Println("Nasset ", string(args[5]))
-	portsAsBytes := args[5]
-	nA := networkAsset{}
-	json.Unmarshal(portsAsBytes, &nA)
-	newWrkSpace.NetAsset = nA
-	fmt.Println("Workspace; ", newWrkSpace, "key: ", key)
-	workspaceAsbytes, _ := json.Marshal(newWrkSpace)
-	stub.PutState(key, workspaceAsbytes)
-
-	return shim.Success(nil)
-
+	_ = stub.PutState(consortiumName, []byte(cons.String()))
+	return shim.Success([]byte(cons.String()))
 }
 
-func (s *SmartContract) QueryWorkspace(APIstub shim.ChaincodeStubInterface, args []string) sc.Response {
-
-	if len(args) != 6 {
-		return shim.Error("Incorrect number of arguments. Expecting 6")
-	}
-	logger.Info("strings", args)
-	indexName := "location~wspID"
-	it, _ := APIstub.GetStateByPartialCompositeKey(indexName, args)
-	defer it.Close()
-	logger.Info("it :", it)
-
-	locationRange, err := it.Next()
-	if err != nil {
-
-		return shim.Error("Worksapce not found")
-	}
-
-	_, compositeKeyParts, err := APIstub.SplitCompositeKey(locationRange.Key)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-
-	keyAsString := compositeKeyParts[6]
-	logger.Info("key: ", keyAsString)
-	wrkSpaceAsBytes, _ := APIstub.GetState("Cubicle101")
-	wrkspace := workspace{}
-	json.Unmarshal(wrkSpaceAsBytes, &wrkspace)
-	logger.Info("workspace ;", wrkspace)
-	return shim.Success(wrkSpaceAsBytes)
-
-}
-
-func (s *SmartContract) CreateConfig(stub shim.ChaincodeStubInterface) sc.Response {
-	logger.Info("-------------------create config----------")
-	org, _ := cid.GetMSPID(stub)
-	orgAsbytes, _ := stub.GetState(org)
-
-	if orgAsbytes != nil {
-		return shim.Error("Configuration already exists")
-	}
-	atrrValue, _, _ := cid.GetAttributeValue(stub, "Role")
-	logger.Info("er ", atrrValue)
-
-	if strings.Compare(strings.ToLower(string(atrrValue)), "network admin") != 0 {
-		logger.Info("attr value: ", strings.Compare(strings.ToLower(string(atrrValue)), "network admin"))
-		return shim.Error("Access denied")
-	}
-
-	Config := config{}
-	Config.Org = org
-	args := stub.GetArgs()
-	configAsBytes := args[1]
-	json.Unmarshal(configAsBytes, &Config)
-	fmt.Println("config")
-	fmt.Println(Config)
-	configAsBytes, _ = json.Marshal(Config)
-	logger.Info("config ", Config)
-	stub.PutState(org, configAsBytes)
-	return shim.Success(nil)
-}
-func (s *SmartContract) BookWorkspace(stub shim.ChaincodeStubInterface) sc.Response {
-
-	logger.Info("=============BookworkSpace---------------")
-	args := stub.GetArgs()
-	indexName := "location~wspID"
-	str := []string{}
-	json.Unmarshal(args[1], &str)
-	fmt.Println("string array of cubicle details:  ", str)
-	it, _ := stub.GetStateByPartialCompositeKey(indexName, str)
-	defer it.Close()
-	logger.Info("it :", it)
-	// ------------------------------------------
-	logger.Info("arg2", args[2])
-	// -----------------------------------------------
-	locationRange, err := it.Next()
-	if err != nil {
-
-		return shim.Error("Worksapce not found")
-	}
-
-	creator, err := stub.GetCreator()
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-
-	id := &mspprotos.SerializedIdentity{}
-	err = proto.Unmarshal(creator, id)
-	block, _ := pem.Decode(id.GetIdBytes())
-	cert, err := x509.ParseCertificate(block.Bytes)
-	enrollID := cert.Subject.CommonName
-	//---------------------------------------------
-	fmt.Println("enrollID", enrollID)
-	//----------------------------------------------------
-	_, compositeKeyParts, err := stub.SplitCompositeKey(locationRange.Key)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	keyAsString := compositeKeyParts[6]
-
-	//---------------------------------------------------------
-	logger.Info("key: ", keyAsString)
-	//-------------------------------------------------------------
-	idsAsBytes, _ := stub.GetState("ids")
-	ids := IDs{}
-	json.Unmarshal(idsAsBytes, &ids)
-	BookingId, _ := strconv.Atoi(ids.BookingId)
-	ids.BookingId = strconv.Itoa(BookingId + 1)
-	//--------------------------------------------------------------
-	fmt.Println("IDs after incerment of booking ID", ids)
-	//--------------------------------------------------------------------
-	idsAsBytes, _ = json.Marshal(ids)
-	stub.PutState("ids", idsAsBytes)
-
-	wrkSpaceAsBytes, _ := stub.GetState(keyAsString)
-	wrkSpace := workspace{}
-	json.Unmarshal(wrkSpaceAsBytes, &wrkSpace)
-	//-------------------------------------------------------------
-	logger.Info("workspace :", wrkSpace)
-	//-----------------------------------------------------------------
-	sch := schedule{}
-	json.Unmarshal(args[2], &sch)
-	sch.BookingStatus = "pending"
-	BookingIdAsstring := strconv.Itoa(BookingId)
-	sch.BookingTxID = stub.GetTxID()
-	schAsbytes, _ := json.Marshal(sch)
-	stub.PutState(BookingIdAsstring, schAsbytes)
-	ush := UserSchedule{}
-	ush.ScheduleId = BookingIdAsstring
-	//---------------------------------------------------------
-	fmt.Println("user schedule", ush)
-	//----------------------------------------------------------
-	ush.WorkSpaceId = keyAsString
-	userAsbytes, _ := stub.GetState(enrollID)
-
-	u := user{}
-	json.Unmarshal(userAsbytes, &u)
-	//--------------------------------------------------------------
-	fmt.Println("user got from enroll ID at line 440", u)
-	//---------------------------------------------------------------
-	u.Calendar = append(u.Calendar, ush)
-	userAsbytes, _ = json.Marshal(u)
-	stub.PutState(enrollID, userAsbytes)
-	//----------------------------------------------------------------
-	fmt.Println("user after assigning schedule", u)
-	//-----------------------------------------------------------------
-	wsch := WSpaceSchedule{}
-	wsch.UserId = enrollID
-	wsch.ScheduleId = BookingIdAsstring
-	wrkSpace.Requests = append(wrkSpace.Requests, wsch)
-
-	//-------------------------------------------------------------------
-	logger.Info("workspace after appending", wrkSpace)
-	//------------------------------------------------------------
-
-	wrkbytes, _ := json.Marshal(wrkSpace)
-	stub.PutState(keyAsString, wrkbytes)
-	wb, _ := stub.GetState(keyAsString)
-	//-------------------------------------------------------------
-	logger.Info("keyafter mofication of schedule,", keyAsString)
-	//-----------------------------------------------------------------
-	wrk := workspace{}
-	json.Unmarshal(wb, &wrk)
-	//----------------------------------------------
-	logger.Info("wrksapce", wrk)
-	//------------------------------------------------
-	return shim.Success(nil)
-}
-
-func (s *SmartContract) QueryAllschedules(stub shim.ChaincodeStubInterface, args []string) sc.Response {
-	logger.Info("-------------------query All schedules ----------")
-
-	atrrValue, _, _ := cid.GetAttributeValue(stub, "Role")
-	logger.Info("Role ", atrrValue)
-
-	if strings.Compare(strings.ToLower(string(atrrValue)), "manager") != 0 {
-		//		logger.Info("acess denied")
-		return shim.Error("Access denied")
-	}
-	startKey := "1001"
-	endKey := "9999"
-	var txid []string
-
-	resultsIterator, err := stub.GetStateByRange(startKey, endKey)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	defer resultsIterator.Close()
-
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		sch := schedule{}
-		json.Unmarshal(queryResponse.Value, &sch)
-		if strings.Compare(sch.BookingStatus, "pending") == 0 {
-			txid = append(txid, sch.BookingTxID)
-		}
-	}
-
-	fmt.Printf("sch obj:\n%s\n", txid)
-	txidAsBytes, _ := json.Marshal(txid)
-	return shim.Success(txidAsBytes)
-}
-
-func (s *SmartContract) ApproveOrDeny(stub shim.ChaincodeStubInterface, args []string) sc.Response {
-	logger.Info("------------------- ApproveOrDeny----------")
-	//args[0]=cubNo. arg[1]=schId arg[2]=uid arg[3]=yes/no
-	var buffer bytes.Buffer
-	//##################################################
-	logger.Info("args received", args)
-	atrrValue, _, _ := cid.GetAttributeValue(stub, "Role")
-	logger.Info("er ", atrrValue)
-
-	if strings.Compare(strings.ToLower(string(atrrValue)), "manager") != 0 {
-
-		return shim.Error("Access denied")
-	}
-
-	wrkSpaceAsBytes, _ := stub.GetState(args[0])
-	wrkSpace := workspace{}
-	json.Unmarshal(wrkSpaceAsBytes, &wrkSpace)
-	sch := schedule{}
-	schAsBytes, _ := stub.GetState(args[1])
-	json.Unmarshal(schAsBytes, &sch)
-	//	-------------------------------------------------
-	fmt.Println(sch.BookingStatus)
-	//	------------------------------------------
-	fmt.Println(strings.Compare(strings.ToLower(sch.BookingStatus), "pending"))
-	//	================================================================================
-
-	if strings.Compare(strings.ToLower(sch.BookingStatus), "pending") == 0 {
-		sch.BookingStatus = args[3]
-	} else {
-		return shim.Error("Already " + sch.BookingStatus)
-	}
-	wrksch := WSpaceSchedule{}
-	if strings.Compare(strings.ToLower(args[3]), "yes") == 0 {
-		wrksch.ScheduleId = args[1]
-		wrksch.UserId = args[2]
-		buffer.WriteString("Approved succefully")
-	}
-	if strings.Compare(strings.ToLower(args[3]), "no") == 0 {
-		buffer.WriteString("Denied succefully")
-	}
-	reqs := wrkSpace.Requests
-	var index int
-	var element WSpaceSchedule
-	for index, element = range reqs {
-		if strings.Compare(strings.ToLower(element.ScheduleId), args[1]) == 0 {
-			reqs = append(reqs[:index], reqs[index+1:]...)
-		}
-	}
-
-	wrkSpace.Requests = reqs
-	wrkSpace.Schedule = append(wrkSpace.Schedule, element)
-	wrkSpaceAsBytes, _ = json.Marshal(wrkSpace)
-	stub.PutState(args[0], wrkSpaceAsBytes)
-
-	schAsBytes, _ = json.Marshal(sch)
-	stub.PutState(args[1], schAsBytes)
-	//	=============================================
-	fmt.Println("workspace", wrkSpace)
-	//	================================================
-	fmt.Println("sch", sch)
-	//================================================
-	return shim.Success(buffer.Bytes())
-
-}
-
-func (s *SmartContract) OccupyWorkSpace(stub shim.ChaincodeStubInterface, args []string) sc.Response {
-	logger.Info("-------------------OccupyWorkspace----------")
-
-	//	schId=arg[0] userId=arg[1] curTime=arg[2] cubId=arg[3]
-	sch := schedule{}
-	logger.Info("args", args)
-	schAsBytes, _ := stub.GetState(args[0])
-	json.Unmarshal(schAsBytes, &sch)
-	logger.Info("sch", sch)
-	curTime, _ := strconv.Atoi(args[2])
-
-	if sch.OccupiedTxID != "" {
-		return shim.Error("Already Occupied with TxID" + sch.OccupiedTxID)
-	}
-	logger.Info("permission comparision")
-	logger.Info(strings.Compare(strings.ToLower(sch.BookingStatus), "yes"))
-
-	if strings.Compare(strings.ToLower(sch.BookingStatus), "yes") != 0 {
-		return shim.Error("Operatio failed\nRequest Status: " + sch.BookingStatus)
-	}
-	// if sch.BookingTime-curTime > 600 {
-	// 	return shim.Error("Try Before 10 minutes of schedule")
-	// }
-	if sch.EndTime <= curTime {
-		return shim.Error("operation falied\n Booking schedule is Ended")
-	}
-	creator, err := stub.GetCreator()
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	id := &mspprotos.SerializedIdentity{}
-	err = proto.Unmarshal(creator, id)
-	block, _ := pem.Decode(id.GetIdBytes())
-	cert, err := x509.ParseCertificate(block.Bytes)
-	enrollID := cert.Subject.CommonName
-
-	if strings.Compare(args[1], enrollID) != 0 {
-		shim.Error("Unknown user")
-	}
-	sch.OccupiedTxID = stub.GetTxID()
-	schAsBytes, _ = json.Marshal(sch)
-	stub.PutState(args[0], schAsBytes)
-	usr := user{}
-	fmt.Println("uid", args[1])
-	usrAsBytes, _ := stub.GetState(args[1])
-	json.Unmarshal(usrAsBytes, &usr)
-	fmt.Println("user")
-	fmt.Println(usr)
-	org, _ := cid.GetMSPID(stub)
-	conf := config{}
-
-	confAsBytes, _ := stub.GetState(org)
-	json.Unmarshal(confAsBytes, &conf)
-	fmt.Println("conf")
-	fmt.Println(conf)
-	restrictedSites := []string{}
-	restrictedSites = conf.BlackList
-	RestrictedIP := []string{}
-	RestrictedIP = conf.RestrictedIP
-
-	WSAsBytes, _ := stub.GetState(args[3])
-	WS := workspace{}
-	json.Unmarshal(WSAsBytes, &WS)
-	Ext_number := WS.NetAsset.Telephone.Extension_Number
-	SwitchID := WS.EAsset.Switches[0].SwitchID
-	resp := Response{}
-	resp.RestrictedIP = RestrictedIP
-	resp.RestrictedSites = restrictedSites
-	resp.Extension_Number = Ext_number
-	resp.SwitchID = SwitchID
-	respAsbytes, _ := json.Marshal(resp)
-	fmt.Println("resp", resp)
-	return shim.Success(respAsbytes)
-}
-func (s *SmartContract) Switching(stub shim.ChaincodeStubInterface, args []string) sc.Response {
-
-	logger.Info("arguments received ", args)
-	// switchID:=args[1]
-	WSAsBytes, _ := stub.GetState(args[2])
-	WS := workspace{}
-	json.Unmarshal(WSAsBytes, &WS)
-	// WS.EAsset.Switches[0].Status=args[0]
-	for index, switches := range WS.EAsset.Switches {
-		if strings.Compare(args[1], switches.SwitchID) == 0 {
-			WS.EAsset.Switches[index].Status = args[0]
-		}
-	}
-
-	WSAsBytes, _ = json.Marshal(WS)
-	logger.Info("WS after updating switch State", WS)
-	stub.PutState(args[2], WSAsBytes)
-	return shim.Success(nil)
-
-}
 func main() {
-	err := shim.Start(new(SmartContract))
-	if err != nil {
-		logger.Error("Error starting Simple chaincode: %s", err)
+	if err := shim.Start(new(Asset)); err != nil {
+		fmt.Printf("Error starting chaincode: %s\n", err)
 	}
 }
