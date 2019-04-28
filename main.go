@@ -1,473 +1,516 @@
 /*
-MIT License
-Copyright (c) 2018 Gökhan Koçak www.gokhankocak.com
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Copyright SecureKey Technologies Inc. All Rights Reserved.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+      http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 */
 
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"time"
+	"sync"
 
-	"github.com/cactus/go-statsd-client/statsd"
-	"github.com/hyperledger/fabric/core/chaincode/shim"
-	"github.com/hyperledger/fabric/protos/peer"
+	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/bccsp"
+	msp "github.com/hyperledger/fabric/msp"
+	"github.com/hyperledger/fabric/protos/common"
+	pb "github.com/hyperledger/fabric/protos/peer"
+
+	protos_utils "github.com/hyperledger/fabric/protos/utils"
+	"github.com/op/go-logging"
+
+	config "github.com/hyperledger/fabric-sdk-go/config"
 )
 
-const (
-	// Version information
-	Version = "1.0"
-)
+var logger = logging.MustGetLogger("fabric_sdk_go")
 
-// SharedCounters are used to keep statistics for operations on shared data
-type SharedCounters struct {
-	GetState   int64 `json:"GetState"`
-	PutState   int64 `json:"Putstate"`
-	DelState   int64 `json:"DelState"`
-	GetHistory int64 `json:"GetHistory"`
-	RichQuery  int64 `json:"RichQuery"`
-	Success    int64 `json:"Success"`
-	Errors     int64 `json:"Errors"`
+// Chain ...
+/**
+ * The “Chain” object captures settings for a channel, which is created by
+ * the orderers to isolate transactions delivery to peers participating on channel.
+ * A chain must be initialized after it has been configured with the list of peers
+ * and orderers. The initialization sends a CONFIGURATION transaction to the orderers
+ * to create the specified channel and asks the peers to join that channel.
+ *
+ */
+type Chain struct {
+	name            string // Name of the chain is only meaningful to the client
+	securityEnabled bool   // Security enabled flag
+	peers           map[string]*Peer
+	tcertBatchSize  int // The number of tcerts to get in each batch
+	orderers        map[string]*Orderer
+	clientContext   *Client
 }
 
-// Statistics for Shared data areas
-type Statistics struct {
-	Shared SharedCounters `json:"Shared"`
+// TransactionProposalResponse ...
+/**
+ * The TransactionProposalResponse result object returned from endorsers.
+ */
+type TransactionProposalResponse struct {
+	Endorser         string
+	ProposalResponse *pb.ProposalResponse
+	Err              error
 }
 
-// KeyModification holds the modification history entries
-type KeyModification struct {
-	TxId      string `json:"TxId"`
-	Value     []byte `json:"Value"`
-	Timestamp int64  `json:"TimeStamp"` // UNIX timestamp as nanoseconds
-	IsDelete  bool   `json:"IsDelete"`
+// TransactionResponse ...
+/**
+ * The TransactionProposalResponse result object returned from orderers.
+ */
+type TransactionResponse struct {
+	Orderer string
+	Err     error
 }
 
-// QueryResults holds the result of rich query
-type QueryResult struct {
-	Namespace string `json:"Namespace"`
-	Key       string `json:"Key"`
-	Value     []byte `json:"Value"`
+// NewChain ...
+/**
+ * @param {string} name to identify different chain instances. The naming of chain instances
+ * is enforced by the ordering service and must be unique within the blockchain network
+ * @param {Client} clientContext An instance of {@link Client} that provides operational context
+ * such as submitting User etc.
+ */
+func NewChain(name string, client *Client) (*Chain, error) {
+	if name == "" {
+		return nil, fmt.Errorf("Failed to create Chain. Missing requirement 'name' parameter.")
+	}
+	if client == nil {
+		return nil, fmt.Errorf("Failed to create Chain. Missing requirement 'clientContext' parameter.")
+	}
+	p := make(map[string]*Peer)
+	o := make(map[string]*Orderer)
+	c := &Chain{name: name, securityEnabled: config.IsSecurityEnabled(), peers: p,
+		tcertBatchSize: config.TcertBatchSize(), orderers: o, clientContext: client}
+	logger.Infof("Constructed Chain instance: %v", c)
+
+	return c, nil
 }
 
-// AsenaSmartContract is the Smart Contract structure
-type AsenaSmartContract struct {
-	Logger *shim.ChaincodeLogger
-	Stats  Statistics
-	Config AsenaConfig
+// GetName ...
+/**
+ * Get the chain name.
+ * @returns {string} The name of the chain.
+ */
+func (c *Chain) GetName() string {
+	return c.name
 }
 
-// AsenaConfig is used to configure the Asena Smart Contract on demand
-type AsenaConfig struct {
-	LogLevel  string `json:"LogLevel"`
-	StatsdUrl string `json:"StatsdUrl"`
+// IsSecurityEnabled ...
+/**
+ * Determine if security is enabled.
+ */
+func (c *Chain) IsSecurityEnabled() bool {
+	return c.securityEnabled
 }
 
-// StatsdReporter reports statistics to the given statsd server
-func (asc *AsenaSmartContract) StatsdReporter(stub shim.ChaincodeStubInterface) peer.Response {
+// GetTCertBatchSize ...
+/**
+ * Get the tcert batch size.
+ */
+func (c *Chain) GetTCertBatchSize() int {
+	return c.tcertBatchSize
+}
 
-	var ErrorCount int
+// SetTCertBatchSize ...
+/**
+ * Set the tcert batch size.
+ */
+func (c *Chain) SetTCertBatchSize(batchSize int) {
+	c.tcertBatchSize = batchSize
+}
 
-	for {
-		time.Sleep(1 * time.Second)
-		cli, err := statsd.NewClient(asc.Config.StatsdUrl, "AsenaSmartContract")
-		if err != nil {
-			ErrorCount++
-			if ErrorCount > 1000 {
-				break
+// AddPeer ...
+/**
+ * Add peer endpoint to chain.
+ * @param {Peer} peer An instance of the Peer that has been initialized with URL,
+ * TLC certificate, and enrollment certificate.
+ */
+func (c *Chain) AddPeer(peer *Peer) {
+	c.peers[peer.GetURL()] = peer
+}
+
+// RemovePeer ...
+/**
+ * Remove peer endpoint from chain.
+ * @param {Peer} peer An instance of the Peer.
+ */
+func (c *Chain) RemovePeer(peer *Peer) {
+	delete(c.peers, peer.GetURL())
+}
+
+// GetPeers ...
+/**
+ * Get peers of a chain from local information.
+ * @returns {[]Peer} The peer list on the chain.
+ */
+func (c *Chain) GetPeers() []*Peer {
+	var peersArray []*Peer
+	for _, v := range c.peers {
+		peersArray = append(peersArray, v)
+	}
+	return peersArray
+}
+
+// AddOrderer ...
+/**
+ * Add orderer endpoint to a chain object, this is a local-only operation.
+ * A chain instance may choose to use a single orderer node, which will broadcast
+ * requests to the rest of the orderer network. Or if the application does not trust
+ * the orderer nodes, it can choose to use more than one by adding them to the chain instance.
+ * All APIs concerning the orderer will broadcast to all orderers simultaneously.
+ * @param {Orderer} orderer An instance of the Orderer class.
+ */
+func (c *Chain) AddOrderer(orderer *Orderer) {
+	c.orderers[orderer.url] = orderer
+}
+
+// RemoveOrderer ...
+/**
+ * Remove orderer endpoint from a chain object, this is a local-only operation.
+ * @param {Orderer} orderer An instance of the Orderer class.
+ */
+func (c *Chain) RemoveOrderer(orderer *Orderer) {
+	delete(c.orderers, orderer.url)
+
+}
+
+// GetOrderers ...
+/**
+ * Get orderers of a chain.
+ */
+func (c *Chain) GetOrderers() []*Orderer {
+	var orderersArray []*Orderer
+	for _, v := range c.orderers {
+		orderersArray = append(orderersArray, v)
+	}
+	return orderersArray
+}
+
+// InitializeChain ...
+/**
+ * Calls the orderer(s) to start building the new chain, which is a combination
+ * of opening new message stream and connecting the list of participating peers.
+ * This is a long-running process. Only one of the application instances needs
+ * to call this method. Once the chain is successfully created, other application
+ * instances only need to call getChain() to obtain the information about this chain.
+ * @returns {bool} Whether the chain initialization process was successful.
+ */
+func (c *Chain) InitializeChain() bool {
+	return false
+}
+
+// UpdateChain ...
+/**
+ * Calls the orderer(s) to update an existing chain. This allows the addition and
+ * deletion of Peer nodes to an existing chain, as well as the update of Peer
+ * certificate information upon certificate renewals.
+ * @returns {bool} Whether the chain update process was successful.
+ */
+func (c *Chain) UpdateChain() bool {
+	return false
+}
+
+// IsReadonly ...
+/**
+ * Get chain status to see if the underlying channel has been terminated,
+ * making it a read-only chain, where information (transactions and states)
+ * can be queried but no new transactions can be submitted.
+ * @returns {bool} Is read-only, true or not.
+ */
+func (c *Chain) IsReadonly() bool {
+	return false //to do
+}
+
+// QueryInfo ...
+/**
+ * Queries for various useful information on the state of the Chain
+ * (height, known peers).
+ * @returns {object} With height, currently the only useful info.
+ */
+func (c *Chain) QueryInfo() {
+	//to do
+}
+
+// QueryBlock ...
+/**
+ * Queries the ledger for Block by block number.
+ * @param {int} blockNumber The number which is the ID of the Block.
+ * @returns {object} Object containing the block.
+ */
+func (c *Chain) QueryBlock(blockNumber int) {
+	//to do
+}
+
+// QueryTransaction ...
+/**
+ * Queries the ledger for Transaction by number.
+ * @param {int} transactionID
+ * @returns {object} Transaction information containing the transaction.
+ */
+func (c *Chain) QueryTransaction(transactionID int) {
+	//to do
+}
+
+// CreateTransactionProposal ...
+/**
+ * Create  a proposal for transaction. This involves assembling the proposal
+ * with the data (chaincodeName, function to call, arguments, transient data, etc.) and signing it using the private key corresponding to the
+ * ECert to sign.
+ */
+func (c *Chain) CreateTransactionProposal(chaincodeName string, chainID string, args []string, sign bool, txid string, transientData []byte) (*pb.SignedProposal, *pb.Proposal, error) {
+
+	argsArray := make([][]byte, len(args))
+	for i, arg := range args {
+		argsArray[i] = []byte(arg)
+	}
+	ccis := &pb.ChaincodeInvocationSpec{ChaincodeSpec: &pb.ChaincodeSpec{
+		Type: pb.ChaincodeSpec_GOLANG, ChaincodeID: &pb.ChaincodeID{Name: chaincodeName},
+		Input: &pb.ChaincodeInput{Args: argsArray}}}
+
+	user, err := c.clientContext.GetUserContext("")
+	if err != nil {
+		return nil, nil, fmt.Errorf("GetUserContext return error: %s", err)
+	}
+	serializedIdentity := &msp.SerializedIdentity{Mspid: config.GetMspID(), IdBytes: user.GetEnrollmentCertificate()}
+	creatorID, err := proto.Marshal(serializedIdentity)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Could not Marshal serializedIdentity, err %s", err)
+	}
+	// create a proposal from a ChaincodeInvocationSpec
+	proposal, err := protos_utils.CreateChaincodeProposalWithTransient(txid, common.HeaderType_ENDORSER_TRANSACTION, chainID, ccis, creatorID, transientData)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Could not create chaincode proposal, err %s", err)
+	}
+
+	proposalBytes, err := protos_utils.GetBytesProposal(proposal)
+	if err != nil {
+		return nil, nil, err
+	}
+	cryptoSuite := c.clientContext.GetCryptoSuite()
+	digest, err := cryptoSuite.Hash(proposalBytes, &bccsp.SHAOpts{})
+	if err != nil {
+		return nil, nil, err
+	}
+	signature, err := cryptoSuite.Sign(user.GetPrivateKey(),
+		digest, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	signedProposal := &pb.SignedProposal{ProposalBytes: proposalBytes, Signature: signature}
+	return signedProposal, proposal, nil
+}
+
+// SendTransactionProposal ...
+// Send  the created proposal to peer for endorsement.
+func (c *Chain) SendTransactionProposal(signedProposal *pb.SignedProposal, retry int) (map[string]*TransactionProposalResponse, error) {
+	if c.peers == nil || len(c.peers) == 0 {
+		return nil, fmt.Errorf("peers is nil")
+	}
+	if signedProposal == nil {
+		return nil, fmt.Errorf("signedProposal is nil")
+	}
+	transactionProposalResponseMap := make(map[string]*TransactionProposalResponse)
+	var wg sync.WaitGroup
+	for _, p := range c.peers {
+		wg.Add(1)
+		go func(peer *Peer, wg *sync.WaitGroup, tprm map[string]*TransactionProposalResponse) {
+			defer wg.Done()
+			var err error
+			var proposalResponse *pb.ProposalResponse
+			var transactionProposalResponse *TransactionProposalResponse
+			logger.Debugf("Send ProposalRequest to peer :%s\n", peer.GetURL())
+			if proposalResponse, err = peer.SendProposal(signedProposal); err != nil {
+				logger.Debugf("Receive Error Response :%v\n", proposalResponse)
+				transactionProposalResponse = &TransactionProposalResponse{peer.GetURL(), nil, fmt.Errorf("Error calling endorser '%s':  %s", peer.GetURL(), err)}
+			} else {
+				prp1, _ := protos_utils.GetProposalResponsePayload(proposalResponse.Payload)
+				act1, _ := protos_utils.GetChaincodeAction(prp1.Extension)
+				logger.Debugf("%s ProposalResponsePayload Extension ChaincodeAction Results\n%s\n", peer.GetURL(), string(act1.Results))
+
+				logger.Debugf("Receive Proposal ChaincodeActionResponse :%v\n", proposalResponse)
+				transactionProposalResponse = &TransactionProposalResponse{peer.GetURL(), proposalResponse, nil}
 			}
-			time.Sleep(15 * time.Second)
-		} else {
-			cli.SetInt("Shared.GetState", asc.Stats.Shared.GetState, 1.0)
-			cli.SetInt("Shared.PutState", asc.Stats.Shared.PutState, 1.0)
-			cli.SetInt("Shared.DelState", asc.Stats.Shared.DelState, 1.0)
-			cli.SetInt("Shared.GetHistory", asc.Stats.Shared.GetHistory, 1.0)
-			cli.SetInt("Shared.RichQuery", asc.Stats.Shared.RichQuery, 1.0)
-			cli.SetInt("Shared.Success", asc.Stats.Shared.Success, 1.0)
-			cli.SetInt("Shared.Errors", asc.Stats.Shared.Errors, 1.0)
-			cli.Close()
+			tprm[transactionProposalResponse.Endorser] = transactionProposalResponse
+		}(p, &wg, transactionProposalResponseMap)
+	}
+	wg.Wait()
+	return transactionProposalResponseMap, nil
+}
+
+// CreateTransaction ...
+/**
+ * Create a transaction with proposal response, following the endorsement policy.
+ */
+func (c *Chain) CreateTransaction(proposal *pb.Proposal, resps []*pb.ProposalResponse) (*pb.Transaction, error) {
+	if len(resps) == 0 {
+		return nil, fmt.Errorf("At least one proposal response is necessary")
+	}
+
+	// the original header
+	hdr, err := protos_utils.GetHeader(proposal.Header)
+	if err != nil {
+		return nil, fmt.Errorf("Could not unmarshal the proposal header")
+	}
+
+	// the original payload
+	pPayl, err := protos_utils.GetChaincodeProposalPayload(proposal.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("Could not unmarshal the proposal payload")
+	}
+
+	// get header extensions so we have the visibility field
+	hdrExt, err := protos_utils.GetChaincodeHeaderExtension(hdr)
+	if err != nil {
+		return nil, err
+	}
+
+	// This code is commented out because the ProposalResponsePayload Extension ChaincodeAction Results
+	// return from endorsements is different so the compare will fail
+
+	//	var a1 []byte
+	//	for n, r := range resps {
+	//		if n == 0 {
+	//			a1 = r.Payload
+	//			if r.Response.Status != 200 {
+	//				return nil, fmt.Errorf("Proposal response was not successful, error code %d, msg %s", r.Response.Status, r.Response.Message)
+	//			}
+	//			continue
+	//		}
+
+	//		if bytes.Compare(a1, r.Payload) != 0 {
+	//			return nil, fmt.Errorf("ProposalResponsePayloads do not match")
+	//		}
+	//	}
+
+	for _, r := range resps {
+		if r.Response.Status != 200 {
+			return nil, fmt.Errorf("Proposal response was not successful, error code %d, msg %s", r.Response.Status, r.Response.Message)
 		}
 	}
 
-	return shim.Success(nil)
-}
-
-// Log is used to log messages
-func (asc *AsenaSmartContract) Log(Level shim.LoggingLevel, format string, args ...interface{}) {
-
-	if asc.Logger == nil {
-		asc.Logger = shim.NewLogger("AsenaSmartContract")
+	// fill endorsements
+	endorsements := make([]*pb.Endorsement, len(resps))
+	for n, r := range resps {
+		endorsements[n] = r.Endorsement
 	}
+	// create ChaincodeEndorsedAction
+	cea := &pb.ChaincodeEndorsedAction{ProposalResponsePayload: resps[0].Payload, Endorsements: endorsements}
 
-	if asc.Logger != nil {
-
-		switch Level {
-		case shim.LogCritical:
-			asc.Logger.Criticalf(format, args)
-		case shim.LogError:
-			asc.Logger.Errorf(format, args)
-		case shim.LogWarning:
-			asc.Logger.Warningf(format, args)
-		case shim.LogNotice:
-			asc.Logger.Noticef(format, args)
-		case shim.LogInfo:
-			asc.Logger.Infof(format, args)
-		case shim.LogDebug:
-			asc.Logger.Debugf(format, args)
-		default:
-			asc.Logger.Infof(format, args)
-		}
-	}
-}
-
-// Init method is called when the Asena Smart Contract is instantiated by the blockchain network
-// Best practice is to have any Ledger initialization in separate function -- see initLedger()
-func (asc *AsenaSmartContract) Init(stub shim.ChaincodeStubInterface) peer.Response {
-	return shim.Success(nil)
-}
-
-// InitLedger is called when instantiating the chaincode
-func (asc *AsenaSmartContract) InitLedger(stub shim.ChaincodeStubInterface) peer.Response {
-
-	type FirstData struct {
-		Key   string `json:"Key"`
-		Value string `json:"Value"`
-	}
-
-	asc.Config = AsenaConfig{LogLevel: "INFO", StatsdUrl: "telegraf.org1.com:8125"}
-	ConfigAsBytes, _ := json.Marshal(asc.Config)
-
-	List := []FirstData{
-		{Key: "AsenaSmartContract.Status", Value: "initialized"},
-		{Key: "AsenaSmartContract.Version", Value: Version},
-		{Key: "AsenaSmartContract.Config", Value: string(ConfigAsBytes)},
-	}
-
-	for _, d := range List {
-		stub.PutState(d.Key, []byte(d.Value))
-	}
-
-	go asc.StatsdReporter(stub)
-
-	return shim.Success([]byte("AsenaSmartContract.InitLedger(): returning success"))
-}
-
-// GetVersion returns the Asena Smart Contract version
-func (asc *AsenaSmartContract) GetVersion(stub shim.ChaincodeStubInterface) peer.Response {
-	return shim.Success([]byte(Version))
-}
-
-// GetStats returns the statistics
-func (asc *AsenaSmartContract) GetStats(stub shim.ChaincodeStubInterface) peer.Response {
-
-	ResultAsBytes, err := json.Marshal(asc.Stats)
+	// obtain the bytes of the proposal payload that will go to the transaction
+	propPayloadBytes, err := protos_utils.GetBytesProposalPayloadForTx(pPayl, hdrExt.PayloadVisibility)
 	if err != nil {
-		return shim.Error("AsenaSmartContract.GetStats(): json.Marshal() failed: " + err.Error())
+		return nil, err
 	}
 
-	return shim.Success([]byte(ResultAsBytes))
+	// get the bytes of the signature header, that will be the header of the TransactionAction
+	sHdrBytes, err := protos_utils.GetBytesSignatureHeader(hdr.SignatureHeader)
+	if err != nil {
+		return nil, err
+	}
+
+	// serialize the chaincode action payload
+	cap := &pb.ChaincodeActionPayload{ChaincodeProposalPayload: propPayloadBytes, Action: cea}
+	capBytes, err := protos_utils.GetBytesChaincodeActionPayload(cap)
+	if err != nil {
+		return nil, err
+	}
+
+	// create a transaction
+	taa := &pb.TransactionAction{Header: sHdrBytes, Payload: capBytes}
+	taas := make([]*pb.TransactionAction, 1)
+	taas[0] = taa
+	tx := &pb.Transaction{Actions: taas}
+
+	return tx, nil
+
 }
 
-// Invoke method is called as a result of an application request to run the Asena Smart Contract
-// The calling application program has also specified the particular smart contract function to be called, with arguments
-func (asc *AsenaSmartContract) Invoke(stub shim.ChaincodeStubInterface) peer.Response {
-
-	// Retrieve the requested Smart Contract function and arguments
-	function, args := stub.GetFunctionAndParameters()
-	// Route to the appropriate handler function to interact with the ledger appropriately
-
-	asc.Log(shim.LogDebug, "Invoke(): called with function: %s and %d args", function, len(args))
-
-	switch function {
-
-	case "SetAsenaConfig":
-		return asc.SetAsenaConfig(stub, args)
-	case "GetAsenaConfig":
-		return asc.GetAsenaConfig(stub, args)
-	case "InitLedger":
-		return asc.InitLedger(stub)
-	case "GetVersion":
-		return asc.GetVersion(stub)
-	case "GetStats":
-		return asc.GetStats(stub)
-	case "GetState":
-		return asc.GetState(stub, args)
-	case "PutState":
-		return asc.PutState(stub, args)
-	case "DelState":
-		return asc.DelState(stub, args)
-	case "GetHistory":
-		return asc.GetHistory(stub, args)
-	case "GetQueryResult":
-		return asc.GetQueryResult(stub, args)
+// SendTransaction ...
+/**
+ * Send a transaction to the chain’s orderer service (one or more orderer endpoints) for consensus and committing to the ledger.
+ * This call is asynchronous and the successful transaction commit is notified via a BLOCK or CHAINCODE event. This method must provide a mechanism for applications to attach event listeners to handle “transaction submitted”, “transaction complete” and “error” events.
+ * Note that under the cover there are two different kinds of communications with the fabric backend that trigger different events to
+ * be emitted back to the application’s handlers:
+ * 1-)The grpc client with the orderer service uses a “regular” stateless HTTP connection in a request/response fashion with the “broadcast” call.
+ * The method implementation should emit “transaction submitted” when a successful acknowledgement is received in the response,
+ * or “error” when an error is received
+ * 2-)The method implementation should also maintain a persistent connection with the Chain’s event source Peer as part of the
+ * internal event hub mechanism in order to support the fabric events “BLOCK”, “CHAINCODE” and “TRANSACTION”.
+ * These events should cause the method to emit “complete” or “error” events to the application.
+ */
+func (c *Chain) SendTransaction(proposal *pb.Proposal, tx *pb.Transaction) (map[string]*TransactionResponse, error) {
+	if c.orderers == nil || len(c.orderers) == 0 {
+		return nil, fmt.Errorf("orderers is nil")
 	}
-
-	return shim.Error("AsenaSmartContract.Invoke(): Invalid Smart Contract function name: " + function)
-}
-
-// main function is only relevant in unit test mode. Only included here for completeness.
-func main() {
-
-	// Create a new Asena Smart Contract
-	err := shim.Start(new(AsenaSmartContract))
+	if proposal == nil {
+		return nil, fmt.Errorf("proposal is nil")
+	}
+	if tx == nil {
+		return nil, fmt.Errorf("Transaction is nil")
+	}
+	// the original header
+	hdr, err := protos_utils.GetHeader(proposal.Header)
 	if err != nil {
-		fmt.Println("Error creating new Asena Smart Contract:", err.Error())
+		return nil, fmt.Errorf("Could not unmarshal the proposal header")
 	}
-}
-
-// SetAsenaConfig is used to configure Asena Smart Contract
-func (asc *AsenaSmartContract) SetAsenaConfig(stub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("SetAsenaConfig(): expecting 1 argument")
-	}
-
-	err := json.Unmarshal([]byte(args[0]), &asc.Config)
+	// serialize the tx
+	txBytes, err := protos_utils.GetBytesTransaction(tx)
 	if err != nil {
-		return shim.Error("SetAsenaConfig(): json.Unmarshal() failed: " + err.Error())
+		return nil, err
 	}
 
-	return shim.Success(nil)
-}
-
-// GetAsenaConfig is used to get the configuration of  Asena Smart Contract
-func (asc *AsenaSmartContract) GetAsenaConfig(stub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	ValueAsBytes, err := json.Marshal(asc.Config)
+	// create the payload
+	payl := &common.Payload{Header: hdr, Data: txBytes}
+	paylBytes, err := protos_utils.GetBytesPayload(payl)
 	if err != nil {
-		return shim.Error("SetAsenaConfig(): json.Marshal() failed: " + err.Error())
+		return nil, err
 	}
 
-	return shim.Success(ValueAsBytes)
-}
-
-// GetState returns the value of the specified `key` from the
-// ledger. Note that GetState doesn't read data from the writeset, which
-// has not been committed to the ledger. In other words, GetState doesn't
-// consider data modified by PutState that has not been committed.
-// If the key does not exist in the state database, (nil, nil) is returned.
-// key := args[0]
-func (asc *AsenaSmartContract) GetState(stub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	asc.Stats.Shared.GetState++
-	if len(args) < 1 {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.GetState(): expecting at least 1 argument")
-	}
-
-	asc.Log(shim.LogDebug, "AsenaSmartContract.GetState(): called with argument: %s", args[0])
-
-	ResultAsBytes, err := stub.GetState(args[0])
+	cryptoSuite := c.clientContext.GetCryptoSuite()
+	digest, err := cryptoSuite.Hash(paylBytes, &bccsp.SHAOpts{})
 	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.GetState(): stub.GetState() failed: " + err.Error())
+		return nil, err
 	}
-
-	asc.Log(shim.LogDebug, "AsenaSmartContract.GetState(): returning success")
-
-	asc.Stats.Shared.Success++
-	return shim.Success(ResultAsBytes)
-}
-
-// PutState puts the specified `key` and `value` into the transaction's
-// writeset as a data-write proposal. PutState doesn't effect the ledger
-// until the transaction is validated and successfully committed.
-// Simple keys must not be an empty string and must not start with null
-// character (0x00), in order to avoid range query collisions with
-// composite keys, which internally get prefixed with 0x00 as composite
-// key namespace.
-// key := args[0]
-// value := args[1]
-func (asc *AsenaSmartContract) PutState(stub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	asc.Stats.Shared.PutState++
-	if len(args) != 2 {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.PutState(): expecting 2 arguments")
-	}
-
-	asc.Log(shim.LogDebug, "AsenaSmartContract.PutState(): called with arguments: %s %s %s", args[0], args[1])
-
-	m := make(map[string]interface{})
-	err := json.Unmarshal([]byte(args[1]), &m)
+	user, err := c.clientContext.GetUserContext("")
 	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.PutState(): json.Unmarshal() failed: " + err.Error())
+		return nil, fmt.Errorf("GetUserContext return error: %s\n", err)
 	}
-
-	ValueAsBytes, err := json.Marshal(m)
+	signature, err := cryptoSuite.Sign(user.GetPrivateKey(),
+		digest, nil)
 	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.PutState(): json.Marshal() failed: " + err.Error())
+		return nil, err
 	}
+	// here's the envelope
+	envelope := &common.Envelope{Payload: paylBytes, Signature: signature}
 
-	err = stub.PutState(args[0], ValueAsBytes)
-	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.PutState(): stub.PutState() failed: " + err.Error())
-	}
+	transactionResponseMap := make(map[string]*TransactionResponse)
+	var wg sync.WaitGroup
+	for _, o := range c.orderers {
+		wg.Add(1)
+		go func(orderer *Orderer, wg *sync.WaitGroup, trm map[string]*TransactionResponse) {
+			defer wg.Done()
+			var err error
+			var transactionResponse *TransactionResponse
 
-	asc.Log(shim.LogDebug, "AsenaSmartContract.PutState(): returning success")
-
-	asc.Stats.Shared.Success++
-	return shim.Success([]byte(args[0])) // return the key
-}
-
-// DelState records the specified `key` to be deleted in the writeset of
-// the transaction proposal. The `key` and its value will be deleted from
-// the ledger when the transaction is validated and successfully committed.
-// key := args[0]
-func (asc *AsenaSmartContract) DelState(stub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	asc.Stats.Shared.DelState++
-	if len(args) != 1 {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.DelState(): expecting 1 argument")
-	}
-
-	err := stub.DelState(args[0])
-	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.DelState(): stub.DelState() failed: " + err.Error())
-	}
-
-	asc.Stats.Shared.Success++
-	return shim.Success([]byte(args[0])) // return the key
-}
-
-// GetHistory returns a history of key values across time.
-// For each historic key update, the historic value and associated
-// transaction id and timestamp are returned. The timestamp is the
-// timestamp provided by the client in the proposal header.
-// GetHistoryForKey requires peer configuration
-// core.ledger.history.enableHistoryDatabase to be true.
-// The query is NOT re-executed during validation phase, phantom reads are
-// not detected. That is, other committed transactions may have updated
-// the key concurrently, impacting the result set, and this would not be
-// detected at validation/commit time. Applications susceptible to this
-// should therefore not use GetHistoryForKey as part of transactions that
-// update ledger, and should limit use to read-only chaincode operations.
-// key := args[0]
-func (asc *AsenaSmartContract) GetHistory(stub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	asc.Stats.Shared.GetHistory++
-	if len(args) != 1 {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.GetHistory(): expecting 1 argument")
-	}
-
-	HistoryIterator, err := stub.GetHistoryForKey(args[0])
-	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.GetHistory(): stub.GetHistoryForKey() failed: " + err.Error())
-	}
-	defer HistoryIterator.Close()
-
-	var ModificationList []KeyModification
-
-	for {
-		if HistoryIterator.HasNext() {
-			History, err := HistoryIterator.Next()
-			if err != nil {
-				asc.Stats.Shared.Errors++
-				return shim.Error("AsenaSmartContract.GetHistory(): stub.HistoryIterator.Next() failed: " + err.Error())
+			logger.Debugf("Send TransactionRequest to orderer :%s\n", orderer.GetURL())
+			if err = orderer.SendBroadcast(envelope); err != nil {
+				logger.Debugf("Receive Error Response from orderer :%v\n", err)
+				transactionResponse = &TransactionResponse{orderer.GetURL(), fmt.Errorf("Error calling endorser '%s':  %s", orderer.GetURL(), err)}
+			} else {
+				logger.Debugf("Receive Success Response from orderer\n")
+				transactionResponse = &TransactionResponse{orderer.GetURL(), nil}
 			}
-			Modification := new(KeyModification)
-			Modification.TxId = History.GetTxId()
-			Value := History.GetValue()
-			Modification.Value = make([]byte, len(Value))
-			copy(Modification.Value, Value)
-			Modification.Timestamp = 1000000000*History.Timestamp.GetSeconds() + int64(History.Timestamp.GetNanos())
-			Modification.IsDelete = History.GetIsDelete()
-			ModificationList = append(ModificationList, *Modification)
-		} else {
-			break
-		}
+			trm[transactionResponse.Orderer] = transactionResponse
+		}(o, &wg, transactionResponseMap)
 	}
+	wg.Wait()
+	return transactionResponseMap, nil
 
-	ResultAsBytes, err := json.Marshal(ModificationList)
-	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.GetHistory(): json.Marshal() failed: " + err.Error())
-	}
-
-	asc.Stats.Shared.Success++
-	return shim.Success(ResultAsBytes)
 }
 
-// GetQueryResult performs a "rich" query against a state database. It is
-// only supported for state databases that support rich query,
-// e.g.CouchDB. The query string is in the native syntax
-// of the underlying state database. An iterator is returned
-// which can be used to iterate over all keys in the query result set.
-// However, if the number of keys in the query result set is greater than the
-// totalQueryLimit (defined in core.yaml), this iterator cannot be used
-// to fetch all keys in the query result set (results will be limited by
-// the totalQueryLimit).
-// The query is NOT re-executed during validation phase, phantom reads are
-// not detected. That is, other committed transactions may have added,
-// updated, or removed keys that impact the result set, and this would not
-// be detected at validation/commit time.  Applications susceptible to this
-// should therefore not use GetQueryResult as part of transactions that update
-// ledger, and should limit use to read-only chaincode operations.
-func (asc *AsenaSmartContract) GetQueryResult(stub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	var ResultList []QueryResult
-
-	asc.Stats.Shared.RichQuery++
-	if len(args) != 1 {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.GetQueryResult(): expecting 1 argument")
-	}
-
-	QueryIterator, err := stub.GetQueryResult(args[0])
-	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.GetQueryResult(): stub.GetQueryResult() failed: " + err.Error())
-	}
-	defer QueryIterator.Close()
-
-	for {
-		if QueryIterator.HasNext() {
-			Query, err := QueryIterator.Next()
-			if err != nil {
-				asc.Stats.Shared.Errors++
-				return shim.Error("AsenaSmartContract.GetQueryResult(): QueryIterator.Next() failed: " + err.Error())
-			}
-			Result := new(QueryResult)
-			Result.Namespace = Query.GetNamespace()
-			Result.Key = Query.GetKey()
-			Value := Query.GetValue()
-			Result.Value = make([]byte, len(Value))
-			copy(Result.Value, Value)
-			ResultList = append(ResultList, *Result)
-		} else {
-			break
-		}
-	}
-
-	ResultAsBytes, err := json.Marshal(ResultList)
-	if err != nil {
-		asc.Stats.Shared.Errors++
-		return shim.Error("AsenaSmartContract.GetQueryResult(): json.Marshal() failed: " + err.Error())
-	}
-
-	asc.Stats.Shared.Success++
-	return shim.Success(ResultAsBytes)
-}
+func main() {}
