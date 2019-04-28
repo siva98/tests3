@@ -1,670 +1,695 @@
-//=================================================
-//Account.go  包括创建学生 部门账户，更新密码，删除账号，登录的功能。
-//
-//=================================================
-
 package main
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"log"
 	"strconv"
+	"strings"
 
+	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/core/chaincode/lib/cid"
 	"github.com/hyperledger/fabric/core/chaincode/shim"
-	pb "github.com/hyperledger/fabric/protos/peer"
+	mspprotos "github.com/hyperledger/fabric/protos/msp"
+	sc "github.com/hyperledger/fabric/protos/peer"
 )
 
-var logger = shim.NewLogger("Account")
+var logger = shim.NewLogger("example_cc0")
 
-// SimpleChaincode example simple Chaincode implementation
-type SimpleChaincode struct {
+type SmartContract struct {
 }
 
-//====================================================================================
-//jieyaojilu
-//====================================================================================
-
-type MoveInf struct {
-	Admin2   string `json:"Admin2"`   // 管理员ID
-	Student2 string `json:"Student2"` //学生ID
-	Point    string `json:"Point"`    // 点数
-	Password string `json:"Password"` // Password
-	Message  string `json:"Message"`  // Message
+type workspace struct {
+	Wtype            string           `json:"WorksapceType"`
+	PhysicalLocation physicalLocation `json:"physicalLocation"`
+	Furnitures       []furniture      `json:"furniture"`
+	EAsset           electricalAsset  `json:electricalAsset`
+	NetAsset         networkAsset     `json:"networkAsset"`
+	Requests         []WSpaceSchedule `json:"requests"`
+	Schedule         []WSpaceSchedule `json:"schedule"`
+}
+type WSpaceSchedule struct {
+	ScheduleId string `json:"schedleId"`
+	UserId     string `json:"UserID"`
+}
+type physicalLocation struct {
+	Country       string `json:"country"`
+	City          string `json:"city"`
+	BuildingName  string `json:buildingName`
+	Floor         string `json:"floor"`
+	Wing          string `json:"wing"`
+	WorkSpaceName string `json:"wspaceName"`
 }
 
-type Transaction struct {
-	Transaction2  string `json:"Transaction2"`  // Transaction Number
-	AdminID       string `json:"AdminID"`       // 数字资产ID
-	StudentID     string `json:"StudentID"`     // 管理员ID
-	AdminPassword string `json:"AdminPassword"` //学生ID
-	Money         string `json:"Money"`         // 点数
-	Time          string `json:"Time"`          //交易时间
-	message       string `json:"message"`       //Message
+type furniture struct {
+	Fname    string `json:"fname"`
+	Quantity string `json:"quantity"`
 }
 
-//====================================================================================
-//学生角色
-//====================================================================================
-type Student struct {
-	Xuehao   string `json:"xuehao"`
-	Name     string `json:"name"`
-	School   string `json:"school"`
-	Password string `json:"password"`
-	Email    string `json:"email"`
-	Money    string `json:"money"`
+type electricalAsset struct {
+	Switches []switchs
 }
 
-//====================================================================================
-//部门角色
-//====================================================================================
-type Admin struct {
-	Gonghao  string `json:"gonghao"`
-	Name     string `json:"name"`
-	School   string `json:"school"`
-	Password string `json:"password"`
-	Partment string `json:"partment"`
+type switchs struct {
+	SwitchID         string `json:"switchID"`
+	SwitchAssignedTo string `json:"switchAssignedTo"`
+	Status           string `json:"Status"`
 }
 
-func (t *SimpleChaincode) Init(stub shim.ChaincodeStubInterface) pb.Response {
+type networkAsset struct {
+	IpPorts   []ipPortsConfig `json:"ipports"`
+	Telephone telePortsConfig `json:"telePorts"`
+}
+
+type ipPortsConfig struct {
+	PortNo          string `json:"ipportNo"`
+	ConfigurationID string `json:"configID"`
+}
+type telePortsConfig struct {
+	Extension_Number string `json:"telePhoneNo"`
+	Organization     string `json:"org"`
+}
+
+type config struct {
+	Org           string   `json:"org"`
+	RestrictedIP  []string `json:"restrictedIP"`
+	Gateway       string   `json:"gateway"`
+	Netmask       string   `json:"netMask"`
+	WhiteList     []string `json:"whiteList"`
+	BlackList     []string `json:"blackList"`
+	DNS_Primary   string   `json:"DNS_Primary"`
+	DNS_Secondary string   `json:"DNS_Secondary"`
+}
+
+type user struct {
+	FirstName string         `json:"fname"`
+	LastName  string         `json:"lastName"`
+	Age       string         `json:"age"`
+	EmailID   string         `json:"emailID"`
+	Org       string         `json:"org"`
+	Calendar  []UserSchedule `json:"calander"`
+	Policy    []policy       `json:"policy"`
+}
+
+type UserSchedule struct {
+	ScheduleId  string `json:"scheduleID"`
+	WorkSpaceId string `json:"wrkSpaceID"`
+}
+
+type schedule struct {
+	StartTime     int    `json:"startTime"`
+	EndTime       int    `json:"endTime"`
+	BookingTime   int    `json:"bookingTime"`
+	BookingStatus string `json:"bookStatus"`
+	OccupiedTxID  string `json:"occupiedTxID"`
+	BookingTxID   string `json:BookingTxID`
+}
+
+type policy struct {
+	WhiteList   []string `json:"userwhitelist"`
+	BlackList   []string `json:"blackList"`
+	PermittedIP []string `json:"permittedIP"`
+}
+
+type IDs struct {
+	CubicleID  string `json:"cubID"`
+	RoomID     string `json:"roomID"`
+	ConfRoomID string `json:"confRoomID"`
+	BookingId  string `json:"BookingId"`
+}
+
+type Response struct {
+	RestrictedSites  []string `json:"restrictedSites"`
+	RestrictedIP     []string `json:"restrictedIP"`
+	Extension_Number string   `json:"extensionNumber"`
+	SwitchID         string   `json:"switchID"`
+}
+
+func (s *SmartContract) Invoke(APIstub shim.ChaincodeStubInterface) sc.Response {
+	logger.Info("-------------------Invoke----------")
+	// Retrieve the requested Smart Contract function and arguments
+	function, args := APIstub.GetFunctionAndParameters()
+	// Route to the appropriate handler function to interact with the ledger appropriately
+	logger.Info("fucntion")
+	logger.Info(function)
+	logger.Info("args")
+	logger.Info(args)
+	if function == "newuser" {
+		return s.KYCRegistration(APIstub, args)
+	} else if function == "newWorkSpace" {
+		return s.CreateWorkspace(APIstub)
+	} else if function == "queryWorkspace" {
+		return s.QueryWorkspace(APIstub, args)
+	} else if function == "createConfig" {
+		return s.CreateConfig(APIstub)
+	} else if function == "bookWorkSpace" {
+		return s.BookWorkspace(APIstub)
+	} else if function == "ApproveOrDeny" {
+		return s.ApproveOrDeny(APIstub, args)
+	} else if function == "occupyWorkSpace" {
+		return s.OccupyWorkSpace(APIstub, args)
+	} else if function == "query" {
+		return s.QueryAllschedules(APIstub, args)
+	} else if function == "switching" {
+		return s.Switching(APIstub, args)
+	}
+
+	return shim.Error("Invalid Smart Contract function name.")
+}
+func (s *SmartContract) Init(APIstub shim.ChaincodeStubInterface) sc.Response {
+	fmt.Println("-----------Instantiating---------------------------")
+	id := []IDs{
+		IDs{CubicleID: "Cubicle101", RoomID: "Room101", ConfRoomID: "ConfRoom101", BookingId: "1001"},
+	}
+
+	idsAsBytes, _ := json.Marshal(id[0])
+	APIstub.PutState("ids", idsAsBytes)
+
 	return shim.Success(nil)
 }
 
-func (t *SimpleChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
-	logger.Info("########### Account Invoke ###########")
+func (s *SmartContract) KYCRegistration(stub shim.ChaincodeStubInterface, args []string) sc.Response {
 
-	function, args := stub.GetFunctionAndParameters()
+	logger.Info("########### KYCRegistration ###########")
 
-	if function == "CreateStudent" {
-		return t.CreateStudent(stub, args)
-	}
-	if function == "CreateAdmin" {
-		return t.CreateAdmin(stub, args)
-	}
-	if function == "StudentUpdatePassword" {
-		return t.StudentUpdatePassword(stub, args)
-	}
-	if function == "AdminUpdatePassword" {
-		return t.AdminUpdatePassword(stub, args)
+	creator, err := stub.GetCreator()
+	if err != nil {
+		return shim.Error(err.Error())
 	}
 
-	if function == "QueryAccount" {
-		return t.QueryAccount(stub, args)
+	id := &mspprotos.SerializedIdentity{}
+	err = proto.Unmarshal(creator, id)
+	block, _ := pem.Decode(id.GetIdBytes())
+	cert, err := x509.ParseCertificate(block.Bytes)
+	enrollID := cert.Subject.CommonName
+
+	userAsbytes, _ := stub.GetState(enrollID)
+
+	if userAsbytes != nil {
+		return shim.Error("User already exists")
 	}
-	if function == "DeleteStudent" {
-		return t.DeleteStudent(stub, args)
-	}
-	if function == "DeleteAdmin" {
-		return t.DeleteAdmin(stub, args)
-	}
-	if function == "loginAdmin" {
-		return t.loginAdmin(stub, args)
-	}
-	if function == "loginStudent" {
-		return t.loginStudent(stub, args)
-	}
-	if function == "movePoint" {
-		return t.movePoint(stub, args)
-	}
-	if function == "getHistoryForKey" {
-		return t.getHistoryForKey(stub, args)
-	}
-	if function == "CreatCredit" {
-		return t.CreatCredit(stub, args)
-	}
-	logger.Errorf("Unknown action, check the first argument, must be one of 'CreateAccount', 'ChangePassword', 'Verify', 'DeleteAccount', or 'QueryAccount'. But got: %v", args[0])
-	return shim.Error(fmt.Sprintf("Unknown action, check the first argument, must be one of 'CreateAccount', 'ChangePassword', 'Verify', 'DeleteAccount', or 'QueryAccount'. But got: %v", args[0]))
+	fmt.Printf("enrollID: %s", enrollID)
+	mspID := id.GetMspid()
+
+	newuser := user{FirstName: args[0], LastName: args[1], Age: args[2], EmailID: args[3]}
+	newuser.Org = mspID
+	newuserAsBytes, _ := json.Marshal(newuser)
+	stub.PutState(enrollID, newuserAsBytes)
+	// fmt.Println("enrollID", enrollID)
+	fmt.Println("user object ", newuser)
+	return shim.Success(nil)
 }
 
-//============================================================================================================
-//创建学生账号
-//============================================================================================================
-func (t *SimpleChaincode) CreateStudent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	fmt.Println("CreateStudent")
+func (s *SmartContract) CreateWorkspace(stub shim.ChaincodeStubInterface) sc.Response {
+
+	logger.Info("##################CreateWorkspace##################")
+
+	atrrValue, _, _ := cid.GetAttributeValue(stub, "Role")
+	logger.Info("Role ", atrrValue)
+
+	if strings.Compare(strings.ToLower(string(atrrValue)), "admin") != 0 {
+		//		logger.Info("acess denied")
+		return shim.Error("Access denied")
+	}
+	args := stub.GetArgs()
+	newWrkSpace := workspace{}
+	idsAsBytes, _ := stub.GetState("ids")
+	id := IDs{}
+	json.Unmarshal(idsAsBytes, &id)
+	key := ""
+
+	//------------------------------get IDS--------------------------------
+	if strings.Compare(strings.ToLower(string(args[1])), "cubicle") == 0 {
+
+		key = id.CubicleID
+		j := string([]rune(id.CubicleID)[7])
+		cubId_no, _ := strconv.Atoi(j)
+		cubId_no = cubId_no + 1
+		cubId := "Cubicle" + strconv.Itoa(cubId_no)
+		id.CubicleID = cubId
+		idsAsBytes, _ = json.Marshal(id)
+		stub.PutState("ids", idsAsBytes)
+
+	} else if strings.Compare(strings.ToLower(string(args[1])), "room") == 0 {
+		key = id.RoomID
+		j := string([]rune(id.RoomID)[4])
+		roomId_no, _ := strconv.Atoi(j)
+		roomId_no = roomId_no + 1
+		roomId := "Room" + strconv.Itoa(roomId_no)
+		id.RoomID = roomId
+		idsAsBytes, _ = json.Marshal(id)
+		stub.PutState("ids", idsAsBytes)
+	} else if strings.Compare(strings.ToLower(string(args[1])), "confroom") == 0 {
+		key = id.ConfRoomID
+		j := string([]rune(id.ConfRoomID)[8])
+		confID_no, _ := strconv.Atoi(j)
+		confID_no = confID_no + 1
+		confID := "ConfRoom" + strconv.Itoa(confID_no)
+		id.ConfRoomID = confID
+		idsAsBytes, _ = json.Marshal(id)
+		stub.PutState("ids", idsAsBytes)
+	} else {
+		shim.Error("Invlaid workspace type")
+	}
+	// ------------------------Wtype---------------
+	newWrkSpace.Wtype = string(args[1])
+	fmt.Println(string(args[1]))
+
+	// ---------------------physical location-----------------
+	physlocation := physicalLocation{}
+	pyslocAsbytes := args[2]
+
+	if err := json.Unmarshal(pyslocAsbytes, &physlocation); err != nil {
+		log.Fatal(err)
+	}
+	//	------------------------validate wether it already exists------------------
+	indexName := "location~wspID"
+	it, _ := stub.GetStateByPartialCompositeKey(indexName, []string{physlocation.Country, physlocation.City, physlocation.BuildingName, physlocation.Floor, physlocation.Wing, physlocation.WorkSpaceName})
+	defer it.Close()
+
+	_, err := it.Next()
+	if err == nil {
+
+		return shim.Error("Worksapce Already Exists")
+	}
+	newWrkSpace.PhysicalLocation = physlocation
+
+	//	----------------------------Adding composite key--------------------
+	location, _ := stub.CreateCompositeKey(indexName, []string{physlocation.Country, physlocation.City, physlocation.BuildingName, physlocation.Floor, physlocation.Wing, physlocation.WorkSpaceName, key})
+	logger.Info("composite key", location)
+	logger.Info("array :", physlocation.Country, physlocation.City, physlocation.BuildingName, physlocation.Floor, physlocation.Wing, physlocation.WorkSpaceName)
+	value := []byte{0x00}
+	stub.PutState(location, value)
+
+	// --------------------------------furnitures------------------
+	furn := []furniture{}
+	furnAsbytes := args[3]
+	if err := json.Unmarshal(furnAsbytes, &furn); err != nil {
+		log.Fatal(err)
+	}
+	newWrkSpace.Furnitures = furn
+	// -----------------------electricalAsset-------------------
+	switchArrAsBytes := args[4]
+	fmt.Println("electrical Asset ", string(args[4]))
+	var switchArrData [][]string
+	json.Unmarshal(switchArrAsBytes, &switchArrData)
+	sw := []switchs{}
+	for i := 0; i < len(switchArrData); i++ {
+
+		s := switchs{}
+		s.SwitchID = switchArrData[i][0]
+		s.SwitchAssignedTo = switchArrData[i][1]
+		s.Status = switchArrData[i][2]
+		sw = append(sw, s)
+	}
+
+	newWrkSpace.EAsset.Switches = sw
+	// --------------------------NetworkAsset-------------------
+	fmt.Println("Nasset ", string(args[5]))
+	portsAsBytes := args[5]
+	nA := networkAsset{}
+	json.Unmarshal(portsAsBytes, &nA)
+	newWrkSpace.NetAsset = nA
+	fmt.Println("Workspace; ", newWrkSpace, "key: ", key)
+	workspaceAsbytes, _ := json.Marshal(newWrkSpace)
+	stub.PutState(key, workspaceAsbytes)
+
+	return shim.Success(nil)
+
+}
+
+func (s *SmartContract) QueryWorkspace(APIstub shim.ChaincodeStubInterface, args []string) sc.Response {
 
 	if len(args) != 6 {
 		return shim.Error("Incorrect number of arguments. Expecting 6")
 	}
+	logger.Info("strings", args)
+	indexName := "location~wspID"
+	it, _ := APIstub.GetStateByPartialCompositeKey(indexName, args)
+	defer it.Close()
+	logger.Info("it :", it)
 
-	var student Student
-	student.Xuehao = args[0]
-	student.Name = args[1]
-	student.Password = args[2]
-	student.School = args[3]
-	student.Email = args[4]
-	student.Money = args[5]
-
-	Bytes, _ := json.Marshal(student)
-
-	// ==== Check if account already exists ====
-	bytes, err := stub.GetState(student.Xuehao)
+	locationRange, err := it.Next()
 	if err != nil {
-		return shim.Error("Failed to get this student: " + err.Error())
-	}
-	if bytes != nil {
-		return shim.Error("This student already exists: " + student.Xuehao)
+
+		return shim.Error("Worksapce not found")
 	}
 
-	//create
-	err = stub.PutState(student.Xuehao, Bytes)
+	_, compositeKeyParts, err := APIstub.SplitCompositeKey(locationRange.Key)
 	if err != nil {
 		return shim.Error(err.Error())
 	}
 
-	return shim.Success([]byte(Bytes))
+	keyAsString := compositeKeyParts[6]
+	logger.Info("key: ", keyAsString)
+	wrkSpaceAsBytes, _ := APIstub.GetState("Cubicle101")
+	wrkspace := workspace{}
+	json.Unmarshal(wrkSpaceAsBytes, &wrkspace)
+	logger.Info("workspace ;", wrkspace)
+	return shim.Success(wrkSpaceAsBytes)
 
 }
 
-//============================================================================================================
-//创建部门账号
-//============================================================================================================
-func (t *SimpleChaincode) CreateAdmin(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	fmt.Println("CreateAdmin")
+func (s *SmartContract) CreateConfig(stub shim.ChaincodeStubInterface) sc.Response {
+	logger.Info("-------------------create config----------")
+	org, _ := cid.GetMSPID(stub)
+	orgAsbytes, _ := stub.GetState(org)
 
-	if len(args) != 5 {
-		return shim.Error("Incorrect number of arguments. Expecting 6")
+	if orgAsbytes != nil {
+		return shim.Error("Configuration already exists")
+	}
+	atrrValue, _, _ := cid.GetAttributeValue(stub, "Role")
+	logger.Info("er ", atrrValue)
+
+	if strings.Compare(strings.ToLower(string(atrrValue)), "network admin") != 0 {
+		logger.Info("attr value: ", strings.Compare(strings.ToLower(string(atrrValue)), "network admin"))
+		return shim.Error("Access denied")
 	}
 
-	var admin Admin
-	admin.Gonghao = args[0]
-	admin.Name = args[1]
-	admin.Password = args[2]
-	admin.School = args[3]
-	admin.Partment = args[4]
+	Config := config{}
+	Config.Org = org
+	args := stub.GetArgs()
+	configAsBytes := args[1]
+	json.Unmarshal(configAsBytes, &Config)
+	fmt.Println("config")
+	fmt.Println(Config)
+	configAsBytes, _ = json.Marshal(Config)
+	logger.Info("config ", Config)
+	stub.PutState(org, configAsBytes)
+	return shim.Success(nil)
+}
+func (s *SmartContract) BookWorkspace(stub shim.ChaincodeStubInterface) sc.Response {
 
-	Bytes, _ := json.Marshal(admin)
-
-	// ==== Check if account already exists ====
-	bytes, err := stub.GetState(admin.Gonghao)
+	logger.Info("=============BookworkSpace---------------")
+	args := stub.GetArgs()
+	indexName := "location~wspID"
+	str := []string{}
+	json.Unmarshal(args[1], &str)
+	fmt.Println("string array of cubicle details:  ", str)
+	it, _ := stub.GetStateByPartialCompositeKey(indexName, str)
+	defer it.Close()
+	logger.Info("it :", it)
+	// ------------------------------------------
+	logger.Info("arg2", args[2])
+	// -----------------------------------------------
+	locationRange, err := it.Next()
 	if err != nil {
-		return shim.Error("Failed to get this admin: " + err.Error())
-	}
-	if bytes != nil {
-		return shim.Error("This admin already exists: " + admin.Gonghao)
+
+		return shim.Error("Worksapce not found")
 	}
 
-	//create
-	err = stub.PutState(admin.Gonghao, Bytes)
+	creator, err := stub.GetCreator()
 	if err != nil {
 		return shim.Error(err.Error())
 	}
 
-	return shim.Success([]byte(Bytes))
-
-}
-
-//======================================================================================================
-// 更改学生密码
-// args: 学号|原密码|新密码
-//======================================================================================================
-func (t *SimpleChaincode) StudentUpdatePassword(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	fmt.Println("UpdatePassword")
-
-	if len(args) != 3 {
-		return shim.Error("Incorrect number of arguments. Expecting 3")
-	}
-
-	//var account Account
-	accountID := args[0]       //学号
-	accountPassword := args[1] //旧密码
-	newPassword := args[2]     //新密码
-	var err error
-
-	Bytes, _ := stub.GetState(accountID)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-	if Bytes == nil {
-		return shim.Error("This account does not exists: " + accountID)
-	}
-	var student Student
-
-	err = json.Unmarshal(Bytes, &student)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-	if student.Password == accountPassword {
-		student.Password = newPassword
-	} else {
-		return shim.Error("wrong password")
-	}
-	bytes, _ := json.Marshal(student)
-	err = stub.PutState(accountID, bytes) //这个地方会报错？？是否需要重新putstate?
+	id := &mspprotos.SerializedIdentity{}
+	err = proto.Unmarshal(creator, id)
+	block, _ := pem.Decode(id.GetIdBytes())
+	cert, err := x509.ParseCertificate(block.Bytes)
+	enrollID := cert.Subject.CommonName
+	//---------------------------------------------
+	fmt.Println("enrollID", enrollID)
+	//----------------------------------------------------
+	_, compositeKeyParts, err := stub.SplitCompositeKey(locationRange.Key)
 	if err != nil {
 		return shim.Error(err.Error())
 	}
+	keyAsString := compositeKeyParts[6]
 
-	return shim.Success([]byte("{\"updatepassword\":\"sucessful\"}"))
+	//---------------------------------------------------------
+	logger.Info("key: ", keyAsString)
+	//-------------------------------------------------------------
+	idsAsBytes, _ := stub.GetState("ids")
+	ids := IDs{}
+	json.Unmarshal(idsAsBytes, &ids)
+	BookingId, _ := strconv.Atoi(ids.BookingId)
+	ids.BookingId = strconv.Itoa(BookingId + 1)
+	//--------------------------------------------------------------
+	fmt.Println("IDs after incerment of booking ID", ids)
+	//--------------------------------------------------------------------
+	idsAsBytes, _ = json.Marshal(ids)
+	stub.PutState("ids", idsAsBytes)
 
+	wrkSpaceAsBytes, _ := stub.GetState(keyAsString)
+	wrkSpace := workspace{}
+	json.Unmarshal(wrkSpaceAsBytes, &wrkSpace)
+	//-------------------------------------------------------------
+	logger.Info("workspace :", wrkSpace)
+	//-----------------------------------------------------------------
+	sch := schedule{}
+	json.Unmarshal(args[2], &sch)
+	sch.BookingStatus = "pending"
+	BookingIdAsstring := strconv.Itoa(BookingId)
+	sch.BookingTxID = stub.GetTxID()
+	schAsbytes, _ := json.Marshal(sch)
+	stub.PutState(BookingIdAsstring, schAsbytes)
+	ush := UserSchedule{}
+	ush.ScheduleId = BookingIdAsstring
+	//---------------------------------------------------------
+	fmt.Println("user schedule", ush)
+	//----------------------------------------------------------
+	ush.WorkSpaceId = keyAsString
+	userAsbytes, _ := stub.GetState(enrollID)
+
+	u := user{}
+	json.Unmarshal(userAsbytes, &u)
+	//--------------------------------------------------------------
+	fmt.Println("user got from enroll ID at line 440", u)
+	//---------------------------------------------------------------
+	u.Calendar = append(u.Calendar, ush)
+	userAsbytes, _ = json.Marshal(u)
+	stub.PutState(enrollID, userAsbytes)
+	//----------------------------------------------------------------
+	fmt.Println("user after assigning schedule", u)
+	//-----------------------------------------------------------------
+	wsch := WSpaceSchedule{}
+	wsch.UserId = enrollID
+	wsch.ScheduleId = BookingIdAsstring
+	wrkSpace.Requests = append(wrkSpace.Requests, wsch)
+
+	//-------------------------------------------------------------------
+	logger.Info("workspace after appending", wrkSpace)
+	//------------------------------------------------------------
+
+	wrkbytes, _ := json.Marshal(wrkSpace)
+	stub.PutState(keyAsString, wrkbytes)
+	wb, _ := stub.GetState(keyAsString)
+	//-------------------------------------------------------------
+	logger.Info("keyafter mofication of schedule,", keyAsString)
+	//-----------------------------------------------------------------
+	wrk := workspace{}
+	json.Unmarshal(wb, &wrk)
+	//----------------------------------------------
+	logger.Info("wrksapce", wrk)
+	//------------------------------------------------
+	return shim.Success(nil)
 }
 
-//======================================================================================================
-// 更改部门密码
-// args: 工号|原密码|新密码
-//======================================================================================================
-func (t *SimpleChaincode) AdminUpdatePassword(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	fmt.Println("UpdatePassword")
+func (s *SmartContract) QueryAllschedules(stub shim.ChaincodeStubInterface, args []string) sc.Response {
+	logger.Info("-------------------query All schedules ----------")
 
-	if len(args) != 3 {
-		return shim.Error("Incorrect number of arguments. Expecting 3")
-	}
+	atrrValue, _, _ := cid.GetAttributeValue(stub, "Role")
+	logger.Info("Role ", atrrValue)
 
-	//var account Account
-	accountID := args[0]       //工号
-	accountPassword := args[1] //旧密码
-	newPassword := args[2]     //新密码
-	var err error
+	if strings.Compare(strings.ToLower(string(atrrValue)), "manager") != 0 {
+		//		logger.Info("acess denied")
+		return shim.Error("Access denied")
+	}
+	startKey := "1001"
+	endKey := "9999"
+	var txid []string
 
-	Bytes, _ := stub.GetState(accountID)
-	if err != nil {
-		return shim.Error("{\"Failed to get account\": \"" + err.Error() + "\"}")
-	}
-	if Bytes == nil {
-		return shim.Error("This accountt does not exists: " + accountID)
-	}
-	var admin Admin
-
-	err = json.Unmarshal(Bytes, &admin)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-	if admin.Password == accountPassword {
-		admin.Password = newPassword
-	} else {
-		return shim.Error("{\"result\":\"wrong password\"}")
-	}
-
-	bytes, _ := json.Marshal(admin)
-	err = stub.PutState(accountID, bytes) //这个地方会报错？？是否需要重新putstate?
+	resultsIterator, err := stub.GetStateByRange(startKey, endKey)
 	if err != nil {
 		return shim.Error(err.Error())
 	}
+	defer resultsIterator.Close()
 
-	return shim.Success([]byte("{\"updatepassword\":\"sucessful\"}"))
+	for resultsIterator.HasNext() {
+		queryResponse, err := resultsIterator.Next()
 
-}
-
-//==============================================================================
-// 查询账户是否存在
-// args: ID
-//==============================================================================
-func (t *SimpleChaincode) QueryAccount(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	accountID := args[0]
-
-	// Get the state from the ledger
-	bytes, err := stub.GetState(accountID)
-	if err != nil {
-		jsonResp := "{\"Error\":\"Failed to get state for " + accountID + "\"}"
-		return shim.Error(jsonResp)
-	}
-	if bytes == nil {
-		jsonResp := "{\"Error\":\"Nil amount for " + accountID + "\"}"
-		return shim.Error(jsonResp)
-	}
-
-	return shim.Success(bytes)
-}
-
-//=============================================================================================
-//zhuanyizixhan simple
-//args:
-//=============================================================================================
-func (t *SimpleChaincode) movePoint(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 5 {
-		return shim.Error("Incorrect number of arguments. Expecting 5")
-	}
-
-	var transaction MoveInf
-	var err error
-	transaction.Admin2 = args[0]
-	transaction.Student2 = args[1]
-	transaction.Password = args[3]
-	transaction.Message = args[4]
-	accountPassword := args[3]
-	//transaction.Point, err = strconv.Atoi(args[2])
-
-	// ==== Check if Seller exists ====
-	bytesAdmin, err := stub.GetState(transaction.Admin2)
-	if err != nil {
-		return shim.Error("Failed to get Seller: " + err.Error())
-	}
-	if bytesAdmin == nil {
-		return shim.Error("This Admin not exists: ")
-	}
-	var admin Admin
-
-	err = json.Unmarshal(bytesAdmin, &admin)
-	if err != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Admin Account \"}")
-	}
-	if admin.Password == accountPassword {
-		// ==== Check if Student exists ====
-		bytesStudent, err := stub.GetState(transaction.Student2)
-		if err != nil {
-			return shim.Error("Failed to get Student: " + err.Error())
-		}
-		if bytesStudent == nil {
-			return shim.Error("This Student not exists: ")
-		}
-		var digitalStudent Student
-		err = json.Unmarshal(bytesStudent, &digitalStudent)
-		if err != nil {
-			return shim.Error("Failed to get Student: " + err.Error())
-		}
-		// ==== Check if Point is a integer ====
-
-		// ==== Move Action ====
-
-		//digitalStudent.Point = digitalStudent.Point + transaction.Point
-
-		var s int
-		s1, err := strconv.Atoi(digitalStudent.Money)
-		s2, err := strconv.Atoi(args[2])
-		s = s1 + s2
-		digitalStudent.Money = strconv.Itoa(s) // must change into int????
-
-		DigitalStudentBytes, _ := json.Marshal(digitalStudent)
-		err = stub.PutState(transaction.Student2, []byte(DigitalStudentBytes))
 		if err != nil {
 			return shim.Error(err.Error())
 		}
-		return shim.Success([]byte("{\"Result\":\"MovePointSuccess\",\"message\":{" + args[4] + "}}"))
+
+		sch := schedule{}
+		json.Unmarshal(queryResponse.Value, &sch)
+		if strings.Compare(sch.BookingStatus, "pending") == 0 {
+			txid = append(txid, sch.BookingTxID)
+		}
 	}
-	return shim.Error("\"Result\":\"fail\",\"Message\":\"Incorrect password\"")
+
+	fmt.Printf("sch obj:\n%s\n", txid)
+	txidAsBytes, _ := json.Marshal(txid)
+	return shim.Success(txidAsBytes)
 }
 
-func (t *SimpleChaincode) CreatCredit(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 6 {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Incorrect number of arguments. Expecting 7 \"}")
-	}
-
-	var transaction Transaction
-	var err error
-	transaction.Transaction2 = args[0]
-	transaction.AdminID = args[1]
-	transaction.StudentID = args[2]
-	transaction.Money = args[3]
-	transaction.Time = args[4]
-	transaction.message = args[5]
-
-	// ==== Check if admin exists ====
-	bytesAdmin, err := stub.GetState(transaction.AdminID)
-	if err != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Failed to get Admin \"}")
-	}
-	if bytesAdmin == nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"This Admin not exists \"}")
-	}
-	var admin Admin
-
-	err = json.Unmarshal(bytesAdmin, &admin)
-	if err != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Admin Account \"}")
-	}
-
-	// ==== Check if Student exists ====
-	bytesStudent, err := stub.GetState(transaction.StudentID)
-	if err != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Student\"}")
-	}
-	if bytesStudent == nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Student Account\"}")
-	}
-	var student Student
-
-	err = json.Unmarshal(bytesStudent, &student)
-	if err != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Account \"" + err.Error() + "\"}")
-	}
-	// ==== Check if Point is a integer ====
-
-	// ==== Move Action ====
-	/*var s int
-	s1, err := strconv.Atoi(student.Money)
-	if err != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Not number\"}")
-	}
-	s2, err1 := strconv.Atoi(args[4])
-	if err1 != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Not number\"}")
-	}
-	s = s1 + s2
-	student.Money = strconv.Itoa(s) // must change into int????
-	DigitalStudentBytes, _ := json.Marshal(student)
-	err = stub.PutState(transaction.StudentID, []byte(DigitalStudentBytes))
-	if err != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to get Student ID\"" + err.Error() + "\"}")
-	}
-	//return shim.Success([]byte("Success move point"))
-	*/
-	// ======Creat train Message=========
-	DigitaltransactionBytes, _ := json.Marshal(transaction)
-	bytes, err := stub.GetState(transaction.Transaction2)
-	if err != nil {
-		return shim.Error("Failed to get transaction: " + err.Error())
-	}
-	if bytes == nil {
-
-	}
-
-	err = stub.PutState(transaction.Transaction2, []byte(DigitaltransactionBytes))
-	if err != nil {
-		return shim.Error("{\"Result\":\"fail\",\"Message\":\"Fail to creat Transaction Message\"}")
-	}
-	return shim.Success([]byte("{\"Result\":\"CreatCrditsuccess\",\"Message\":\"Success to creat Transaction Message\"}"))
-
-	return shim.Error("{\"Result\":\"fail\",\"Message\":\"Wrong Password\"}")
-
-}
-
-//=============================================================================================
-//删除学生
-//args: ID
-//=============================================================================================
-func (t *SimpleChaincode) DeleteStudent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	fmt.Println("DeleteAccount")
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	accountID := args[0]
-	bytes, err := stub.GetState(accountID)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-	if bytes == nil {
-		return shim.Error("this account is not found")
-	}
-
-	var student Student
-	err = json.Unmarshal(bytes, &student)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-
-	student = Student{} //delete the struct
-	bytes, err = json.Marshal(student)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	err = stub.PutState(accountID, bytes)
-
-	err = stub.DelState(accountID)
-	if err != nil {
-		return shim.Error("Failed to delete state:" + err.Error())
-	}
-	bytes, err = stub.GetState(accountID)
-	if err != nil {
-		return shim.Success([]byte("{\"delete \":\"delete sucessful\"}"))
-	}
-
-	return shim.Success([]byte("{\"delete \":\"delete sucessful\"}")) //
-}
-
-//=============================================================================================
-//删除学生
-//args: ID
-//=============================================================================================
-func (t *SimpleChaincode) DeleteAdmin(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	fmt.Println("DeleteAccount")
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	accountID := args[0]
-	bytes, err := stub.GetState(accountID)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-	if bytes == nil {
-		return shim.Error("this account is not found")
-	}
-
-	var admin Admin
-	err = json.Unmarshal(bytes, &admin)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-
-	admin = Admin{} //delete the struct
-	bytes, err = json.Marshal(admin)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	err = stub.PutState(accountID, bytes)
-
-	err = stub.DelState(accountID)
-	if err != nil {
-		return shim.Error("Failed to delete state:" + err.Error())
-	}
-	bytes, err = stub.GetState(accountID)
-	if err != nil {
-		return shim.Success([]byte("{\"delete \":\"delete sucessful\"}"))
-	}
-
-	return shim.Success([]byte("{\"delete \":\"delete sucessful\"}"))
-}
-
-//================
-//验证Student账号密码是否匹配 args:ID|Password
-//================
-func (t *SimpleChaincode) loginStudent(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-
-	if len(args) != 2 {
-		return shim.Error("Incorrect number of arguments. Expecting 2")
-	}
-
-	accountID := args[0]
-	password := args[1]
-
-	//query the ledger
-	bytes, err := stub.GetState(accountID)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-	if bytes == nil {
-		return shim.Error("This account does not exists: " + accountID)
-	}
-	var student Student
-	err = json.Unmarshal(bytes, &student)
-	if err != nil {
-		return shim.Error("Failed to get Student account: " + err.Error())
-	}
-	if student.Password == password {
-		return shim.Success([]byte("{\"login\":\"loginSuccess\"}"))
-	} else {
-		return shim.Error("{\"login\":\"wrong password\"}")
-	}
-}
-
-//================
-//验证Admin账号密码是否匹配 args:ID|Password
-//================
-func (t *SimpleChaincode) loginAdmin(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-
-	if len(args) != 2 {
-		return shim.Error("Incorrect number of arguments. Expecting 2")
-	}
-	accountID := args[0]
-	password := args[1]
-
-	//query the ledger
-	bytes, err := stub.GetState(accountID)
-	if err != nil {
-		return shim.Error("Failed to get account: " + err.Error())
-	}
-	if bytes == nil {
-		return shim.Error("This account does not exists: " + accountID)
-	}
-	var admin Admin
-	err = json.Unmarshal(bytes, &admin)
-	if err != nil {
-		return shim.Error("Failed to get admin account: " + err.Error())
-	}
-	if admin.Password == password {
-		return shim.Success([]byte("{\"login\":\"loginSuccess\"}"))
-	} else {
-		return shim.Error("{\"login\":\"wrong password\"}")
-	}
-}
-
-func (t *SimpleChaincode) getHistoryForKey(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 2,function followed by 1 accountID and 1 value")
-	}
-
-	var accountID string //Entities
-	var err error
-	accountID = args[0]
-	//Get the state from the ledger
-	//TODD:will be nice to have a GetAllState call to ledger
-	HisInterface, err := stub.GetHistoryForKey(accountID)
-	fmt.Println(HisInterface)
-	Avalbytes, err := getHistoryListResult(HisInterface)
-	if err != nil {
-		return shim.Error("Failed to get history")
-	}
-	return shim.Success([]byte(Avalbytes))
-}
-
-func getHistoryListResult(resultsIterator shim.HistoryQueryIteratorInterface) ([]byte, error) {
-
-	defer resultsIterator.Close()
-	// buffer is a JSON array containing QueryRecords
+func (s *SmartContract) ApproveOrDeny(stub shim.ChaincodeStubInterface, args []string) sc.Response {
+	logger.Info("------------------- ApproveOrDeny----------")
+	//args[0]=cubNo. arg[1]=schId arg[2]=uid arg[3]=yes/no
 	var buffer bytes.Buffer
-	buffer.WriteString("[")
+	//##################################################
+	logger.Info("args received", args)
+	atrrValue, _, _ := cid.GetAttributeValue(stub, "Role")
+	logger.Info("er ", atrrValue)
 
-	bArrayMemberAlreadyWritten := false
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return nil, err
-		}
-		// Add a comma before array members, suppress it for the first array member
-		if bArrayMemberAlreadyWritten == true {
-			buffer.WriteString(",")
-		}
-		item, _ := json.Marshal(queryResponse)
-		buffer.Write(item)
-		bArrayMemberAlreadyWritten = true
+	if strings.Compare(strings.ToLower(string(atrrValue)), "manager") != 0 {
+
+		return shim.Error("Access denied")
 	}
-	buffer.WriteString("]")
-	fmt.Printf("queryResult:\n%s\n", buffer.String())
-	return buffer.Bytes(), nil
+
+	wrkSpaceAsBytes, _ := stub.GetState(args[0])
+	wrkSpace := workspace{}
+	json.Unmarshal(wrkSpaceAsBytes, &wrkSpace)
+	sch := schedule{}
+	schAsBytes, _ := stub.GetState(args[1])
+	json.Unmarshal(schAsBytes, &sch)
+	//	-------------------------------------------------
+	fmt.Println(sch.BookingStatus)
+	//	------------------------------------------
+	fmt.Println(strings.Compare(strings.ToLower(sch.BookingStatus), "pending"))
+	//	================================================================================
+
+	if strings.Compare(strings.ToLower(sch.BookingStatus), "pending") == 0 {
+		sch.BookingStatus = args[3]
+	} else {
+		return shim.Error("Already " + sch.BookingStatus)
+	}
+	wrksch := WSpaceSchedule{}
+	if strings.Compare(strings.ToLower(args[3]), "yes") == 0 {
+		wrksch.ScheduleId = args[1]
+		wrksch.UserId = args[2]
+		buffer.WriteString("Approved succefully")
+	}
+	if strings.Compare(strings.ToLower(args[3]), "no") == 0 {
+		buffer.WriteString("Denied succefully")
+	}
+	reqs := wrkSpace.Requests
+	var index int
+	var element WSpaceSchedule
+	for index, element = range reqs {
+		if strings.Compare(strings.ToLower(element.ScheduleId), args[1]) == 0 {
+			reqs = append(reqs[:index], reqs[index+1:]...)
+		}
+	}
+
+	wrkSpace.Requests = reqs
+	wrkSpace.Schedule = append(wrkSpace.Schedule, element)
+	wrkSpaceAsBytes, _ = json.Marshal(wrkSpace)
+	stub.PutState(args[0], wrkSpaceAsBytes)
+
+	schAsBytes, _ = json.Marshal(sch)
+	stub.PutState(args[1], schAsBytes)
+	//	=============================================
+	fmt.Println("workspace", wrkSpace)
+	//	================================================
+	fmt.Println("sch", sch)
+	//================================================
+	return shim.Success(buffer.Bytes())
+
 }
 
-//=======================================================================================
-//main function
-//=================================================================================
-func main() {
-	err := shim.Start(new(SimpleChaincode))
+func (s *SmartContract) OccupyWorkSpace(stub shim.ChaincodeStubInterface, args []string) sc.Response {
+	logger.Info("-------------------OccupyWorkspace----------")
+
+	//	schId=arg[0] userId=arg[1] curTime=arg[2] cubId=arg[3]
+	sch := schedule{}
+	logger.Info("args", args)
+	schAsBytes, _ := stub.GetState(args[0])
+	json.Unmarshal(schAsBytes, &sch)
+	logger.Info("sch", sch)
+	curTime, _ := strconv.Atoi(args[2])
+
+	if sch.OccupiedTxID != "" {
+		return shim.Error("Already Occupied with TxID" + sch.OccupiedTxID)
+	}
+	logger.Info("permission comparision")
+	logger.Info(strings.Compare(strings.ToLower(sch.BookingStatus), "yes"))
+
+	if strings.Compare(strings.ToLower(sch.BookingStatus), "yes") != 0 {
+		return shim.Error("Operatio failed\nRequest Status: " + sch.BookingStatus)
+	}
+	// if sch.BookingTime-curTime > 600 {
+	// 	return shim.Error("Try Before 10 minutes of schedule")
+	// }
+	if sch.EndTime <= curTime {
+		return shim.Error("operation falied\n Booking schedule is Ended")
+	}
+	creator, err := stub.GetCreator()
 	if err != nil {
-		fmt.Printf("Error starting Simple chaincode: %s", err)
+		return shim.Error(err.Error())
+	}
+	id := &mspprotos.SerializedIdentity{}
+	err = proto.Unmarshal(creator, id)
+	block, _ := pem.Decode(id.GetIdBytes())
+	cert, err := x509.ParseCertificate(block.Bytes)
+	enrollID := cert.Subject.CommonName
+
+	if strings.Compare(args[1], enrollID) != 0 {
+		shim.Error("Unknown user")
+	}
+	sch.OccupiedTxID = stub.GetTxID()
+	schAsBytes, _ = json.Marshal(sch)
+	stub.PutState(args[0], schAsBytes)
+	usr := user{}
+	fmt.Println("uid", args[1])
+	usrAsBytes, _ := stub.GetState(args[1])
+	json.Unmarshal(usrAsBytes, &usr)
+	fmt.Println("user")
+	fmt.Println(usr)
+	org, _ := cid.GetMSPID(stub)
+	conf := config{}
+
+	confAsBytes, _ := stub.GetState(org)
+	json.Unmarshal(confAsBytes, &conf)
+	fmt.Println("conf")
+	fmt.Println(conf)
+	restrictedSites := []string{}
+	restrictedSites = conf.BlackList
+	RestrictedIP := []string{}
+	RestrictedIP = conf.RestrictedIP
+
+	WSAsBytes, _ := stub.GetState(args[3])
+	WS := workspace{}
+	json.Unmarshal(WSAsBytes, &WS)
+	Ext_number := WS.NetAsset.Telephone.Extension_Number
+	SwitchID := WS.EAsset.Switches[0].SwitchID
+	resp := Response{}
+	resp.RestrictedIP = RestrictedIP
+	resp.RestrictedSites = restrictedSites
+	resp.Extension_Number = Ext_number
+	resp.SwitchID = SwitchID
+	respAsbytes, _ := json.Marshal(resp)
+	fmt.Println("resp", resp)
+	return shim.Success(respAsbytes)
+}
+func (s *SmartContract) Switching(stub shim.ChaincodeStubInterface, args []string) sc.Response {
+
+	logger.Info("arguments received ", args)
+	// switchID:=args[1]
+	WSAsBytes, _ := stub.GetState(args[2])
+	WS := workspace{}
+	json.Unmarshal(WSAsBytes, &WS)
+	// WS.EAsset.Switches[0].Status=args[0]
+	for index, switches := range WS.EAsset.Switches {
+		if strings.Compare(args[1], switches.SwitchID) == 0 {
+			WS.EAsset.Switches[index].Status = args[0]
+		}
+	}
+
+	WSAsBytes, _ = json.Marshal(WS)
+	logger.Info("WS after updating switch State", WS)
+	stub.PutState(args[2], WSAsBytes)
+	return shim.Success(nil)
+
+}
+func main() {
+	err := shim.Start(new(SmartContract))
+	if err != nil {
+		logger.Error("Error starting Simple chaincode: %s", err)
 	}
 }
