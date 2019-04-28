@@ -1,2164 +1,1399 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright SecurityNameship.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE/2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
-/*
- * The sample smart contract for documentation topic:
- * Writing Your First Blockchain Application
- */
-/*
-Building Chaincode
-Now let’s compile your chaincode.
-go get -u --tags nopkcs11 github.com/hyperledger/fabric/core/chaincode/shim
-go build --tags nopkcs11
-*/
-
 package main
 
-/* Imports
- * 4 utility libraries for formatting, handling bytes, reading and writing JSON, and string manipulation
- * 2 specific Hyperledger Fabric specific libraries for Smart Contracts
- */
 import (
 	"bytes"
 	"encoding/json"
-
-	//"errors"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"net"
-	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	// "reflect"
 
 	"github.com/hyperledger/fabric/core/chaincode/shim"
 	"github.com/hyperledger/fabric/protos/peer"
 )
 
-// Define the Smart Contract structure
+var logger = shim.NewLogger("ExchainChaincode")
+
+var TICKETID = 0
+
+// declare Lob_Name array to translate LoBID(int) into corresponding string name
+const NumberOfLoBs = 8
+
+var Lob_Name = [NumberOfLoBs]string{"MD_office", "HANA", "SMB", "IBS", "S4_HANA", "GS", "SF", "IoT"}
+
+//Enum of LOBs
+const (
+	MD_office = iota
+	HANA
+	SMB
+	IBS
+	S4_HANA
+	GS
+	SF
+	IoT
+	//numberOfLoBs
+)
+
+const (
+	P0 = iota
+	P1
+)
+
+//TicketID status
+//Created   ->  Applied  -> Ongoing  ->   Done
+const (
+	Created = iota
+	Applied
+	Ongoing
+	Done
+)
+
+//Participant information
+//   UserID:        iXXXXXX
+//   UserName:      Bill Xu
+//   Password:      *********
+//   IsAdmin:       True or False
+//   LoB:           0. MD_office  1. HANA  2. SMB...
+type Participant struct {
+	UserID   string `json:"Participant_UserID"`
+	UserName string `json:"Participant_UserName"`
+	Password string `json:"Participant_Password"`
+
+	IsAdmin bool `json:"Participant_IsAdmin"`
+	LoBID   int  `json:"Participant_LoBID"`
+}
+
+//Credit infomation
+//UserID:     iXXXXXX
+//Value:      123
+//TicketIDs:  1. TicketNumber
+//            2. Ticket array
+type Credit struct {
+	UserID string `json:"Credit_UserID"`
+	Value  int    `json:"Credit_Value"`
+
+	TicketIDs []string `json:"Credit_TicketIDs"`
+}
+
+// add methods to compare struct Credit based on Credit.Value
+type Credits []Credit
+
+func (s Credits) Len() int { // 重写 Len() 方法
+	return len(s)
+}
+func (s Credits) Swap(i, j int) { // 重写 Swap() 方法
+	s[i], s[j] = s[j], s[i]
+}
+func (s Credits) Less(i, j int) bool { // 重写 Less() 方法
+	return s[i].Value > s[j].Value
+}
+
+type LoB struct {
+	LoBID       int `json:"LoB_LoBID"`
+	TotalCredit int `json:"LoB_TotalCredit"`
+
+	UserIDs []string `json:"LoB_UserIDs"`
+}
+
+// Ticket information
+//TicketID:
+//Status:
+
+//Title:
+//Type:
+
+//Value:
+//UserID:
+
+//DeadLine:
+//Comment:
+//Policy:
+
+type Ticket struct {
+	TicketID string `json:"Ticket_TicketID"`
+	Status   int    `json:"Ticket_Status"`
+
+	Title string `json:"Ticket_Title"`
+	Type  int    `json:"Ticket_Type"`
+
+	Value  int    `json:"Ticket_Value"`
+	UserID string `json:"Ticket_UserID"`
+
+	DeadLine time.Time `json:"Ticket_Deadline"`
+	Comment  string    `json:"Ticket_Comment"`
+	Policy   string    `json:"Ticket_Policy"`
+}
+
+// Order information
+// TicketID:
+// UserID:           iXXXXXX
+// Status:           Created   ->  Applied  -> Ongoing  ->   Done
+type Order struct {
+	TicketID string `json:"TicketID"`
+	UserID   string `json:"UserID"`
+	Status   int    `json:"Status"`
+}
+
+//SmartContract - Chaincode for asset Reading
 type SmartContract struct {
 }
 
-const (
-	millisPerSecond       = int64(time.Second / time.Millisecond)
-	nanosPerMillisecond   = int64(time.Millisecond / time.Nanosecond)
-	layout                = "2006/01/02"
-	unitAmount            = int64(1000000)           //1單位=100萬
-	perDayMillionInterest = float64(27.3972603)      //每1百萬面額，利率=1%，一天的利息
-	perDayInterest        = float64(0.0000273972603) //每1元面額，利率=1%，一天的利息
-	//InterestObjectType    = "Interest"
-)
-
-type Cpty struct {
-	ObjectType string `json:"docType"` //Cpty
-	CptyID     string `json:"CptyID"`
-	CptyName   string `json:"CptyName"`
-	CptyStatus string `json:"CptyStatus"` //Lock, Active
-	UpdateTime string `json:"updateTime"` //更新時間
+//ReadingIDIndex - Index on IDs for retrieval all Readings
+type ReadingIDIndex struct {
+	UserIDs []string `json:"UserIDs"`
 }
 
-type User struct {
-	ObjectType string `json:"docType"` //User
-	UserID     string `json:"UserID"`  //CptyID + TimeNow 0001 + 20190224105134
-	CptyID     string `json:"CptyID"`
-	UserName   string `json:"UserName"`
-	Password   string `json:"Password"`
-	UserStatus string `json:"UserStatus"` //Lock, Active
-	UpdateTime string `json:"updateTime"` //更新時間
-}
-
-type CptyISDA struct {
-	ObjectType      string  `json:"docType"`    //CptyISDA
-	CptyISDAID      string  `json:"CptyISDAID"` //OwnCptyID + CptyID + TimeNow
-	OwnCptyID       string  `json:"OwnCptyID"`
-	CptyID          string  `json:"CptyID"`          //交易對手
-	CptyIndependAmt int64   `json:"CptyIndependAmt"` //交易對手單獨提列金額
-	OwnIndependAmt  int64   `json:"OwnIndependAmt"`  //本行單獨提列金額
-	CptyThreshold   int64   `json:"CptyThreshold"`   //交易對手門檻金額
-	OwnThreshold    int64   `json:"OwnThreshold"`    //本行門鑑金額
-	CptyMTA         int64   `json:"CptyMTA"`         //交易對手最低轉讓金額
-	OwnMTA          int64   `json:"OwnMTA"`          //本行最低轉讓金額
-	Rounding        int64   `json:"Rounding"`        //整數計算
-	StartDate       string  `json:"StartDate"`       //合約起日
-	EndDate         string  `json:"EndDate"`         //合約迄日
-	USDCashPCT      float64 `json:"USDCashPCT"`      //USDCashPCT
-	TWDCashPCT      float64 `json:"TWDCashPCT"`      //TWDCashPCT
-	USDBondPCT      float64 `json:"USDBondPCT"`      //USDBondPCT
-	TWDBondPCT      float64 `json:"TWDBondPCT"`      //TWDBondPCT
-}
-
-type CptyAsset struct {
-	ObjectType  string  `json:"docType"`     //CptyAsset
-	CptyAssetID string  `json:"CptyAssetID"` //OwnCptyID + TimeNow
-	OwnCptyID   string  `json:"OwnCptyID"`
-	USDBond     float64 `json:"USDBond"` //USDBondPCT
-	TWDBond     float64 `json:"TWDBond"` //TWDBondPCT
-	AUD         float64 `json:"AUD"`     //AUD
-	BRL         float64 `json:"BRL"`     //BRL
-	CAD         float64 `json:"CAD"`     //CAD
-	CHF         float64 `json:"CHF"`     //CHF
-	CNY         float64 `json:"CNY"`     //CNY
-	EUR         float64 `json:"EUR"`     //EUR
-	GBP         float64 `json:"GBP"`     //GBP
-	HKD         float64 `json:"HKD"`     //HKD
-	INR         float64 `json:"INR"`     //INR
-	JPY         float64 `json:"JPY"`     //JPY
-	KRW         float64 `json:"KRW"`     //KRW
-	MOP         float64 `json:"MOP"`     //MOP
-	MYR         float64 `json:"MYR"`     //MYR
-	NZD         float64 `json:"NZD"`     //NZD
-	PHP         float64 `json:"PHP"`     //PHP
-	SEK         float64 `json:"SEK"`     //SEK
-	SGD         float64 `json:"SGD"`     //SGD
-	THB         float64 `json:"THB"`     //THB
-	TWD         float64 `json:"TWD"`     //TWD
-	USD         float64 `json:"USD"`     //USD
-	ZAR         float64 `json:"ZAR"`     //ZAR
-}
-
-type FXTrade struct {
-	ObjectType   string  `json:"docType"` //docType is used to distinguish the various types of objects in state database
-	TXID         string  `json:"TXID"`    //OwnCptyID + TXType + TimeNow
-	TXType       string  `json:"TXType"`  //Transaction TXType BUY or SELL
-	TXKinds      string  `json:"TXKinds"` //交易種類SPOT or FW
-	OwnCptyID    string  `json:"OwnCptyID"`
-	CptyID       string  `json:"CptyID"`       //交易對手
-	TradeDate    string  `json:"TradeDate"`    //交易日
-	MaturityDate string  `json:"MaturityDate"` //到期日
-	Contract     string  `json:"Contract"`     //交易合約
-	Curr1        string  `json:"Curr1"`        //Curr1
-	Amount1      float64 `json:"Amount1"`      //Amount1
-	Curr2        string  `json:"Curr2"`        //Curr2
-	Amount2      float64 `json:"Amount2"`      //Amount2
-	NetPrice     float64 `json:"NetPrice"`     //合約價
-
-	isPutToQueue bool   `json:"isPutToQueue"` //isPutToQueue = true 代表資料檢核成功
-	TXStatus     string `json:"TXStatus"`     //Pending, Matched, Finished, Cancelled, PaymentError,
-	CreateTime   string `json:"createTime"`   //建立時間
-	UpdateTime   string `json:"updateTime"`   //更新時間
-	TXIndex      string `json:"TXIndex"`      //Transaction Index(全部比對)
-	TXHcode      string `json:"TXHcode"`      //Transaction Hcode(更正交易序號)
-	MatchedTXID  string `json:"MatchedTXID"`  //比對序號 OwnCptyID(後來新增的)+TXType+TimeNow 0002S20180829063021
-	TXMemo       string `json:"TXMemo"`       //交易說明
-	TXErrMsg     string `json:"TXErrMsg"`     //交易錯誤說明
-}
-
-/*
- * The Init method is called when the Smart Contract "CGSecurity" is instantiated by the blockchain network
- * Best practice is to have any Ledger initialization in sepaRate function // see initLedger()
- */
-func (s *SmartContract) Init(APIstub shim.ChaincodeStubInterface) peer.Response {
-
-	return shim.Success(nil)
-}
-
-/*
- * The Invoke method is called as a result of an application request to run the Smart Contract "CGSecurity"
- * The calling application program has also specified the particular smart contract function to be called, with arguments
- */
-func (s *SmartContract) Invoke(APIstub shim.ChaincodeStubInterface) peer.Response {
-
-	// Retrieve the requested Smart Contract function and arguments
-	function, args := APIstub.GetFunctionAndParameters()
-	// Route to the appropriate handler function to interact with the ledger appropriately
-	if function == "createCpty" {
-		return s.createCpty(APIstub, args)
-	} else if function == "updateCpty" {
-		return s.updateCpty(APIstub, args)
-	} else if function == "deleteCpty" {
-		return s.deleteCpty(APIstub, args)
-	} else if function == "queryCpty" {
-		return s.queryCpty(APIstub, args)
-	} else if function == "queryAllCpty" {
-		return s.queryAllCpty(APIstub, args)
-		//User
-	} else if function == "createUser" {
-		return s.createUser(APIstub, args)
-	} else if function == "updateUser" {
-		return s.updateUser(APIstub, args)
-	} else if function == "queryUser" {
-		return s.queryUser(APIstub, args)
-		//CptyISDA
-	} else if function == "createCptyISDA" {
-		return s.createCptyISDA(APIstub, args)
-	} else if function == "updateCptyISDA" {
-		return s.updateCptyISDA(APIstub, args)
-	} else if function == "deleteCptyISDA" {
-		return s.deleteCptyISDA(APIstub, args)
-	} else if function == "queryCptyISDA" {
-		return s.queryCptyISDA(APIstub, args)
-	} else if function == "queryCptyISDAByCpty" {
-		return s.queryCptyISDAByCpty(APIstub, args)
-	} else if function == "queryAllCptyISDA" {
-		return s.queryAllCptyISDA(APIstub, args)
-		//CptyAsset
-	} else if function == "createCptyAsset" {
-		return s.createCptyAsset(APIstub, args)
-	} else if function == "updateCptyAsset" {
-		return s.updateCptyAsset(APIstub, args)
-	} else if function == "queryTXIDCptyAsset" {
-		return s.queryTXIDCptyAsset(APIstub, args)
-	} else if function == "CreateCashFlow" {
-		return s.CreateCashFlow(APIstub, args)
-
-		//} else if function == "fetchEURUSDviaOraclize" {
-		//	return s.fetchEURUSDviaOraclize(APIstub)
-
-	} else if function == "getrate" {
-		return s.getrate(APIstub, args)
-
-		// Transaction Functions
-	} else if function == "FXTradeTransfer" {
-		return s.FXTradeTransfer(APIstub, args)
-	} else if function == "CorrectFXTradeTransfer" {
-		return s.CorrectFXTradeTransfer(APIstub, args)
-		// Transaction MTM Functions
-	} else if function == "FXTradeMTM" {
-		return s.FXTradeMTM(APIstub, args)
-	} else if function == "CreateFXTradeMTM" {
-		return s.CreateFXTradeMTM(APIstub, args)
-	} else if function == "deleteFXTradeMTM" {
-		return s.deleteFXTradeMTM(APIstub, args)
-	} else if function == "QueryFXTradeMTM" {
-		return s.QueryFXTradeMTM(APIstub, args)
-		// Transaction Settlment Functions
-	} else if function == "FXTradeSettlment" {
-		return s.FXTradeSettlment(APIstub, args)
-		// Transaction FXTradeCollateral Functions
-	} else if function == "FXTradeCollateral" {
-		return s.FXTradeCollateral(APIstub, args)
-	} else if function == "UpdateFXTradeCollateral" {
-		return s.UpdateFXTradeCollateral(APIstub, args)
-	} else if function == "CreateCollateralDetail" {
-		return s.CreateCollateralDetail(APIstub, args)
-	} else if function == "CollateralSettlment" {
-		return s.CollateralSettlment(APIstub, args)
-	} else if function == "queryFXTradeCollateral" {
-		return s.queryFXTradeCollateral(APIstub, args)
-		// MTM Price Functions
-	} else if function == "createMTMPrice" {
-		return s.createMTMPrice(APIstub, args)
-	} else if function == "createBondPrice" {
-		return s.createBondPrice(APIstub, args)
-
-	} else if function == "queryTables" {
-		return s.queryTables(APIstub, args)
-	} else if function == "queryTXIDTransactions" {
-		return s.queryTXIDTransactions(APIstub, args)
-	} else if function == "queryTXIDCollateral" {
-		return s.queryTXIDCollateral(APIstub, args)
-	} else if function == "queryTXKEYTransactions" {
-		return s.queryTXKEYTransactions(APIstub, args)
-	} else if function == "queryHistoryTXKEYTransactions" {
-		return s.queryHistoryTXKEYTransactions(APIstub, args)
-	} else if function == "getHistoryForTransaction" {
-		return s.getHistoryForTransaction(APIstub, args)
-	} else if function == "getHistoryTXIDForTransaction" {
-		return s.getHistoryTXIDForTransaction(APIstub, args)
-	} else if function == "getHistoryForQueuedTransaction" {
-		return s.getHistoryForQueuedTransaction(APIstub, args)
-	} else if function == "getHistoryTXIDForQueuedTransaction" {
-		return s.getHistoryTXIDForQueuedTransaction(APIstub, args)
-	} else if function == "queryAllTransactions" {
-		return s.queryAllTransactions(APIstub, args)
-	} else if function == "queryAllQueuedTransactions" {
-		return s.queryAllQueuedTransactions(APIstub, args)
-	} else if function == "queryAllHistoryTransactions" {
-		return s.queryAllHistoryTransactions(APIstub, args)
-	} else if function == "queryAllTransactionKeys" {
-		return s.queryAllTransactionKeys(APIstub, args)
-	} else if function == "queryQueuedTransactionStatus" {
-		return s.queryQueuedTransactionStatus(APIstub, args)
-	} else if function == "queryHistoryTransactionStatus" {
-		return s.queryHistoryTransactionStatus(APIstub, args)
-	} else if function == "queryMTMTransactionStatus" {
-		return s.queryMTMTransactionStatus(APIstub, args)
-	} else if function == "queryCollateralTransactionStatus" {
-		return s.queryCollateralTransactionStatus(APIstub, args)
-	} else if function == "queryCollateralDetailStatus" {
-		return s.queryCollateralDetailStatus(APIstub, args)
-	} else if function == "queryDayEndCollateralStatus" {
-		return s.queryDayEndCollateralStatus(APIstub, args)
-	} else if function == "queryCptyISDAStatus" {
-		return s.queryCptyISDAStatus(APIstub, args)
-	} else if function == "queryCptyAssetStatus" {
-		return s.queryCptyAssetStatus(APIstub, args)
-	} else if function == "queryCashFlowStatus" {
-		return s.queryCashFlowStatus(APIstub, args)
-	} else if function == "queryMTMPrice" {
-		return s.queryMTMPrice(APIstub, args)
-	} else if function == "queryBondPrice" {
-		return s.queryBondPrice(APIstub, args)
-	} else if function == "updateQueuedTransactionHcode" {
-		return s.updateQueuedTransactionHcode(APIstub, args)
-	} else if function == "updateHistoryTransactionHcode" {
-		return s.updateHistoryTransactionHcode(APIstub, args)
-	} else if function == "testEvent" {
-		return s.testEvent(APIstub, args)
-
-	} else {
-		//map functions
-		return s.mapFunction(APIstub, function, args)
-	}
-
-	return shim.Error("Invalid Smart Contract function name.")
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["testEvent"]}' -C myc
-func (s *SmartContract) testEvent(stub shim.ChaincodeStubInterface, args []string) peer.Response {
-	tosend := "Event send data is here!"
-	err := stub.SetEvent("evtsender", []byte(tosend))
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	return shim.Success(nil)
-}
-
-func (s *SmartContract) mapFunction(stub shim.ChaincodeStubInterface, function string, args []string) peer.Response {
-	switch function {
-
-	case "put":
-		if len(args) < 2 {
-			return shim.Error("put operation must include two arguments: [key, value]")
-		}
-		key := args[0]
-		value := args[1]
-
-		if err := stub.PutState(key, []byte(value)); err != nil {
-			fmt.Printf("Error putting state %s", err)
-			return shim.Error(fmt.Sprintf("put operation failed. Error updating state: %s", err))
-		}
-
-		indexName := "compositeKeyTest"
-		compositeKeyTestIndex, err := stub.CreateCompositeKey(indexName, []string{key})
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		valueByte := []byte{0x00}
-		if err := stub.PutState(compositeKeyTestIndex, valueByte); err != nil {
-			fmt.Printf("Error putting state with compositeKey %s", err)
-			return shim.Error(fmt.Sprintf("put operation failed. Error updating state with compositeKey: %s", err))
-		}
-
-		return shim.Success(nil)
-
-	case "remove":
-		if len(args) < 1 {
-			return shim.Error("remove operation must include one argument: [key]")
-		}
-		key := args[0]
-
-		err := stub.DelState(key)
-		if err != nil {
-			return shim.Error(fmt.Sprintf("remove operation failed. Error updating state: %s", err))
-		}
-		return shim.Success(nil)
-
-	case "get":
-		if len(args) < 1 {
-			return shim.Error("get operation must include one argument, a key")
-		}
-		key := args[0]
-		value, err := stub.GetState(key)
-		if err != nil {
-			return shim.Error(fmt.Sprintf("get operation failed. Error accessing state: %s", err))
-		}
-		jsonVal, err := json.Marshal(string(value))
-		return shim.Success(jsonVal)
-
-	case "keys":
-		if len(args) < 2 {
-			return shim.Error("put operation must include two arguments, a key and value")
-		}
-		startKey := args[0]
-		endKey := args[1]
-
-		//sleep needed to test peer's timeout behavior when using iterators
-		stime := 0
-		if len(args) > 2 {
-			stime, _ = strconv.Atoi(args[2])
-		}
-
-		keysIter, err := stub.GetStateByRange(startKey, endKey)
-		if err != nil {
-			return shim.Error(fmt.Sprintf("keys operation failed. Error accessing state: %s", err))
-		}
-		defer keysIter.Close()
-
-		var keys []string
-		for keysIter.HasNext() {
-			//if sleeptime is specied, take a nap
-			if stime > 0 {
-				time.Sleep(time.Duration(stime) * time.Millisecond)
-			}
-
-			response, iterErr := keysIter.Next()
-			if iterErr != nil {
-				return shim.Error(fmt.Sprintf("keys operation failed. Error accessing state: %s", err))
-			}
-			keys = append(keys, response.Key)
-		}
-
-		for key, value := range keys {
-			fmt.Printf("key %d contains %s\n", key, value)
-		}
-
-		jsonKeys, err := json.Marshal(keys)
-		if err != nil {
-			return shim.Error(fmt.Sprintf("keys operation failed. Error marshaling JSON: %s", err))
-		}
-
-		return shim.Success(jsonKeys)
-	case "query":
-		query := args[0]
-		keysIter, err := stub.GetQueryResult(query)
-		if err != nil {
-			return shim.Error(fmt.Sprintf("query operation failed. Error accessing state: %s", err))
-		}
-		defer keysIter.Close()
-
-		var keys []string
-		for keysIter.HasNext() {
-			response, iterErr := keysIter.Next()
-			if iterErr != nil {
-				return shim.Error(fmt.Sprintf("query operation failed. Error accessing state: %s", err))
-			}
-			keys = append(keys, response.Key)
-		}
-
-		jsonKeys, err := json.Marshal(keys)
-		if err != nil {
-			return shim.Error(fmt.Sprintf("query operation failed. Error marshaling JSON: %s", err))
-		}
-
-		return shim.Success(jsonKeys)
-	case "history":
-		key := args[0]
-		keysIter, err := stub.GetHistoryForKey(key)
-		if err != nil {
-			return shim.Error(fmt.Sprintf("query operation failed. Error accessing state: %s", err))
-		}
-		defer keysIter.Close()
-
-		var keys []string
-		for keysIter.HasNext() {
-			response, iterErr := keysIter.Next()
-			if iterErr != nil {
-				return shim.Error(fmt.Sprintf("query operation failed. Error accessing state: %s", err))
-			}
-			keys = append(keys, response.TxId)
-		}
-
-		for key, txID := range keys {
-			fmt.Printf("key %d contains %s\n", key, txID)
-		}
-
-		jsonKeys, err := json.Marshal(keys)
-		if err != nil {
-			return shim.Error(fmt.Sprintf("query operation failed. Error marshaling JSON: %s", err))
-		}
-
-		return shim.Success(jsonKeys)
-
-	default:
-		return shim.Success([]byte("Unsupported operation"))
-	}
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["createCpty", "0001","CptyA","Active"]}' -C myc
-//peer chaincode invoke -n mycc -c '{"Args":["createCpty", "0002","CptyB","Active"]}' -C myc
-//peer chaincode invoke -n mycc -c '{"Args":["createCpty", "0003","CptyC","Active"]}' -C myc
-func (s *SmartContract) createCpty(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	TimeNow2 := time.Now().Format(timelayout2)
-
-	if len(args) != 3 {
-		return shim.Error("Incorrect number of arguments. Expecting 3")
-	}
-
-	fmt.Sprintf(TimeNow2)
-	var Cpty = Cpty{ObjectType: "Cpty", CptyID: args[0], CptyName: args[1], CptyStatus: args[2], UpdateTime: TimeNow2}
-	CptyAsBytes, _ := json.Marshal(Cpty)
-	err := APIstub.PutState(Cpty.CptyID, CptyAsBytes)
-	if err != nil {
-		return shim.Error("Failed to create state")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["updateCpty", "0001","Lock"]}' -C myc
-func (s *SmartContract) updateCpty(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 2 {
-		return shim.Error("Incorrect number of arguments. Expecting 2")
-	}
-
-	// 判斷是否有輸入值
-
-	CptyAsBytes, _ := APIstub.GetState(args[0])
-	Cpty := Cpty{}
-
-	json.Unmarshal(CptyAsBytes, &Cpty)
-	Cpty.ObjectType = "Cpty"
-	Cpty.CptyStatus = args[1]
-	Cpty.UpdateTime = time.Now().Format(timelayout2)
-
-	CptyAsBytes, _ = json.Marshal(Cpty)
-	err := APIstub.PutState(args[0], CptyAsBytes)
-	if err != nil {
-		return shim.Error("Failed to change state")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["deleteCpty", "0003"]}' -C myc
-func (s *SmartContract) deleteCpty(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	// Delete the key from the state in ledger
-	err := APIstub.DelState(args[0])
-	if err != nil {
-		return shim.Error("Failed to delete state")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryCpty","0001"]}' -C myc
-func (s *SmartContract) queryCpty(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-	var queryString string
-	CptyID := args[0]
-	if CptyID == "All" {
-		queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"Cpty\"}}")
-	} else {
-		queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"Cpty\",\"CptyID\":\"%s\"}}", CptyID)
-	}
-
-	resultsIterator, err := APIstub.GetQueryResult(queryString)
-	fmt.Printf("APIstub.GetQueryResult(queryString)\n")
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	defer resultsIterator.Close()
-	fmt.Printf("esultsIterator.Close")
-
-	var buffer bytes.Buffer
-	buffer.WriteString("[")
-
-	bArrayMemberAlreadyWritten := false
-	fmt.Printf("bArrayMemberAlreadyWritten := false\n")
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		if bArrayMemberAlreadyWritten == true {
-			buffer.WriteString(",")
-		}
-		fmt.Printf("resultsIterator.HasNext\n")
-		buffer.WriteString("{\"Key\":")
-		buffer.WriteString("\"")
-		buffer.WriteString(queryResponse.Key)
-		buffer.WriteString("\"")
-		buffer.WriteString(", \"Record\":")
-
-		buffer.WriteString(string(queryResponse.Value))
-		buffer.WriteString("}")
-		bArrayMemberAlreadyWritten = true
-	}
-
-	buffer.WriteString("]")
-
-	return shim.Success(buffer.Bytes())
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryAllCpty","0001","9999"]}' -C myc
-func (s *SmartContract) queryAllCpty(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 2 {
-		return shim.Error("Incorrect number of arguments. Expecting 2")
-	}
-	startKey := args[0]
-	endKey := args[1]
-
-	resultsIterator, err := APIstub.GetStateByRange(startKey, endKey)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	defer resultsIterator.Close()
-
-	// buffer is a JSON array containing QueryResults
-	var buffer bytes.Buffer
-	buffer.WriteString("[")
-
-	bArrayMemberAlreadyWritten := false
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-		// Add a comma before array members, suppress it for the first array member
-		if bArrayMemberAlreadyWritten == true {
-			buffer.WriteString(",")
-		}
-		buffer.WriteString("{\"Key\":")
-		buffer.WriteString("\"")
-		buffer.WriteString(queryResponse.Key)
-		buffer.WriteString("\"")
-
-		buffer.WriteString(", \"Record\":")
-		// Record is a JSON object, so we write as-is
-		buffer.WriteString(string(queryResponse.Value))
-		buffer.WriteString("}")
-		bArrayMemberAlreadyWritten = true
-	}
-	buffer.WriteString("]")
-
-	fmt.Printf("%s", buffer.String())
-
-	return shim.Success(buffer.Bytes())
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["createUser", "0001","Cpty1User1","Cpty1Pass1","Active"]}' -C myc
-func (s *SmartContract) createUser(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	TimeNow := time.Now().Format(timelayout)
-	TimeNow2 := time.Now().Format(timelayout2)
-
-	if len(args) != 4 {
-		return shim.Error("Incorrect number of arguments. Expecting 4")
-	}
-
-	UserID := args[0] + TimeNow
-	//fmt.Sprintf(TimeNow2)
-	var User = User{ObjectType: "User", UserID: UserID, CptyID: args[0], UserName: args[1], Password: args[2], UserStatus: args[3], UpdateTime: TimeNow2}
-	UserAsBytes, _ := json.Marshal(User)
-	err := APIstub.PutState(User.UserID, UserAsBytes)
-	if err != nil {
-		return shim.Error("Failed to create state")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["updateUser", "000120190224105134","Cpty1User1","Cpty1Pass2","Active"]}' -C myc
-func (s *SmartContract) updateUser(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 4 {
-		return shim.Error("Incorrect number of arguments. Expecting 4")
-	}
-
-	UserAsBytes, _ := APIstub.GetState(args[0])
-	User := User{}
-
-	json.Unmarshal(UserAsBytes, &User)
-	User.ObjectType = "User"
-	User.UserName = args[1]
-	User.Password = args[2]
-	User.UserStatus = args[3]
-	User.UpdateTime = time.Now().Format(timelayout2)
-
-	UserAsBytes, _ = json.Marshal(User)
-	err := APIstub.PutState(args[0], UserAsBytes)
-	if err != nil {
-		return shim.Error("Failed to change state")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryUser","0001","Cpty1User1"]}' -C myc
-func (s *SmartContract) queryUser(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 2 {
-		return shim.Error("Incorrect number of arguments. Expecting 2")
-	}
-	var queryString string
-	CptyID := args[0]
-	UserName := args[1]
-	if CptyID == "All" {
-		queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"User\"}}")
-	} else {
-		queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"User\",\"CptyID\":\"%s\",\"UserName\":\"%s\"}}", CptyID, UserName)
-	}
-
-	resultsIterator, err := APIstub.GetQueryResult(queryString)
-	fmt.Printf("APIstub.GetQueryResult(queryString)\n")
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	defer resultsIterator.Close()
-	fmt.Printf("esultsIterator.Close")
-
-	var buffer bytes.Buffer
-	buffer.WriteString("[")
-
-	bArrayMemberAlreadyWritten := false
-	fmt.Printf("bArrayMemberAlreadyWritten := false\n")
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		if bArrayMemberAlreadyWritten == true {
-			buffer.WriteString(",")
-		}
-		fmt.Printf("resultsIterator.HasNext\n")
-		buffer.WriteString("{\"Key\":")
-		buffer.WriteString("\"")
-		buffer.WriteString(queryResponse.Key)
-		buffer.WriteString("\"")
-		buffer.WriteString(", \"Record\":")
-
-		buffer.WriteString(string(queryResponse.Value))
-		buffer.WriteString("}")
-		bArrayMemberAlreadyWritten = true
-	}
-
-	buffer.WriteString("]")
-
-	return shim.Success(buffer.Bytes())
-}
-
-/*
-peer chaincode invoke -n mycc -c '{"Args":["createCptyISDA", "0001","0003","0","0","35000000","8000000","3000000","500000","100000","2018/01/01","2020/12/31","1","0.95","0.96","0.89"]}' -C myc
-peer chaincode invoke -n mycc -c '{"Args":["createCptyISDA", "0001","0002","0","0","25000000","6000000","3000000","500000","100000","2018/01/01","2020/12/31","1","0.95","0.96","0.89"]}' -C myc
-peer chaincode invoke -n mycc -c '{"Args":["createCptyISDA", "0001","0004","0","0","45000000","7000000","3000000","500000","100000","2018/01/01","2020/12/31","1","0.95","0.96","0.89"]}' -C myc
-*/
-func (s *SmartContract) createCptyISDA(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	TimeNow := time.Now().Format(timelayout)
-
-	if len(args) != 15 {
-		return shim.Error("Incorrect number of arguments. Expecting 15")
-	}
-
-	var newCptyIndependAmt, newOwnIndependAmt, newCptyThreshold, newOwnThreshold, newCptyMTA, newOwnMTA, newRounding int64
-	var newUSDCashPCT, newTWDCashPCT, newUSDBondPCT, newTWDBondPCT float64
-	var OwnCptyID, CptyID, CptyISDAID string
-
-	OwnCptyID = args[0]
-	CptyID = args[1]
-
-	newCptyIndependAmt, err := strconv.ParseInt(args[2], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newOwnIndependAmt, err = strconv.ParseInt(args[3], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCptyThreshold, err = strconv.ParseInt(args[4], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newOwnThreshold, err = strconv.ParseInt(args[5], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCptyMTA, err = strconv.ParseInt(args[6], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newOwnMTA, err = strconv.ParseInt(args[7], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newRounding, err = strconv.ParseInt(args[8], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDCashPCT, err = strconv.ParseFloat(args[11], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTWDCashPCT, err = strconv.ParseFloat(args[12], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDBondPCT, err = strconv.ParseFloat(args[13], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTWDBondPCT, err = strconv.ParseFloat(args[14], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-
-	CptyISDAID = OwnCptyID + CptyID + TimeNow
-	fmt.Println("createCptyISDA= " + CptyISDAID + "\n")
-
-	var CptyISDA = CptyISDA{ObjectType: "CptyISDA", CptyISDAID: CptyISDAID, OwnCptyID: OwnCptyID, CptyID: CptyID, CptyIndependAmt: newCptyIndependAmt, OwnIndependAmt: newOwnIndependAmt, CptyThreshold: newCptyThreshold, OwnThreshold: newOwnThreshold, CptyMTA: newCptyMTA, OwnMTA: newOwnMTA, Rounding: newRounding, StartDate: args[9], EndDate: args[10], USDCashPCT: newUSDCashPCT, TWDCashPCT: newTWDCashPCT, USDBondPCT: newUSDBondPCT, TWDBondPCT: newTWDBondPCT}
-	CptyISDAAsBytes, _ := json.Marshal(CptyISDA)
-	err1 := APIstub.PutState(CptyISDA.CptyISDAID, CptyISDAAsBytes)
-	if err1 != nil {
-		return shim.Error("Failed to create state")
-		fmt.Println("createCptyISDA.PutState\n")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["updateCptyISDA", "0001","0002","0","0","25500000","8000000","3000000","500000","100000","2018/01/01","2020/12/31","1","0.95","0.96","0.89","0001000320180923051259"]}' -C myc
-func (s *SmartContract) updateCptyISDA(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 16 {
-		return shim.Error("Incorrect number of arguments. Expecting 16")
-	}
-
-	// 判斷是否有輸入值
-
-	CptyISDAAsBytes, _ := APIstub.GetState(args[15])
-	CptyISDA := CptyISDA{}
-
-	var newCptyIndependAmt, newOwnIndependAmt, newCptyThreshold, newOwnThreshold, newCptyMTA, newOwnMTA, newRounding int64
-	var newUSDCashPCT, newTWDCashPCT, newUSDBondPCT, newTWDBondPCT float64
-
-	newCptyIndependAmt, err := strconv.ParseInt(args[2], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newOwnIndependAmt, err = strconv.ParseInt(args[3], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCptyThreshold, err = strconv.ParseInt(args[4], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newOwnThreshold, err = strconv.ParseInt(args[5], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCptyMTA, err = strconv.ParseInt(args[6], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newOwnMTA, err = strconv.ParseInt(args[7], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newRounding, err = strconv.ParseInt(args[8], 10, 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDCashPCT, err = strconv.ParseFloat(args[11], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTWDCashPCT, err = strconv.ParseFloat(args[12], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDBondPCT, err = strconv.ParseFloat(args[13], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTWDBondPCT, err = strconv.ParseFloat(args[14], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	json.Unmarshal(CptyISDAAsBytes, &CptyISDA)
-	CptyISDA.ObjectType = "CptyISDA"
-	CptyISDA.OwnCptyID = args[0]
-	CptyISDA.CptyID = args[1]
-	CptyISDA.CptyIndependAmt = newCptyIndependAmt
-	CptyISDA.OwnIndependAmt = newOwnIndependAmt
-	CptyISDA.CptyThreshold = newCptyThreshold
-	CptyISDA.OwnThreshold = newOwnThreshold
-	CptyISDA.CptyMTA = newCptyMTA
-	CptyISDA.OwnMTA = newOwnMTA
-	CptyISDA.Rounding = newRounding
-	CptyISDA.StartDate = args[9]
-	CptyISDA.EndDate = args[10]
-	CptyISDA.USDCashPCT = newUSDCashPCT
-	CptyISDA.TWDCashPCT = newTWDCashPCT
-	CptyISDA.USDBondPCT = newUSDBondPCT
-	CptyISDA.TWDBondPCT = newTWDBondPCT
-
-	CptyISDAAsBytes, _ = json.Marshal(CptyISDA)
-	err1 := APIstub.PutState(args[15], CptyISDAAsBytes)
-	if err1 != nil {
-		return shim.Error("Failed to change state")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["deleteCptyISDA", "00003"]}' -C myc
-func (s *SmartContract) deleteCptyISDA(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	// Delete the key from the state in ledger
-	err := APIstub.DelState(args[0])
-	if err != nil {
-		return shim.Error("Failed to delete state")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryCptyISDA","0001000320180923051259"]}' -C myc
-func (s *SmartContract) queryCptyISDA(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	CptyISDAAsBytes, _ := APIstub.GetState(args[0])
-	return shim.Success(CptyISDAAsBytes)
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryAllCptyISDA","00001","99999"]}' -C myc
-func (s *SmartContract) queryAllCptyISDA(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 2 {
-		return shim.Error("Incorrect number of arguments. Expecting 2")
-	}
-	startKey := args[0]
-	endKey := args[1]
-
-	resultsIterator, err := APIstub.GetStateByRange(startKey, endKey)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	defer resultsIterator.Close()
-
-	// buffer is a JSON array containing QueryResults
-	var buffer bytes.Buffer
-	buffer.WriteString("[")
-
-	bArrayMemberAlreadyWritten := false
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-		// Add a comma before array members, suppress it for the first array member
-		if bArrayMemberAlreadyWritten == true {
-			buffer.WriteString(",")
-		}
-		buffer.WriteString("{\"Key\":")
-		buffer.WriteString("\"")
-		buffer.WriteString(queryResponse.Key)
-		buffer.WriteString("\"")
-
-		buffer.WriteString(", \"Record\":")
-		// Record is a JSON object, so we write as-is
-		buffer.WriteString(string(queryResponse.Value))
-		buffer.WriteString("}")
-		bArrayMemberAlreadyWritten = true
-	}
-	buffer.WriteString("]")
-
-	fmt.Printf("%s", buffer.String())
-
-	return shim.Success(buffer.Bytes())
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryCptyISDAStatus","0001"]}' -C myc
-func (s *SmartContract) queryCptyISDAStatus(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-	var queryString, queryString2 string
-	CptyID := args[0]
-
-	if CptyID == "All" {
-		queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"CptyISDA\"}}")
-	} else {
-		queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"CptyISDA\",\"OwnCptyID\":\"%s\"}}", CptyID)
-		queryString2 = fmt.Sprintf("{\"selector\":{\"docType\":\"CptyISDA\",\"CptyID\":\"%s\"}}", CptyID)
-	}
-
-	resultsIterator, err := APIstub.GetQueryResult(queryString)
-	fmt.Printf("APIstub.GetQueryResult(queryString)\n")
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	defer resultsIterator.Close()
-	fmt.Printf("esultsIterator.Close")
-
-	var buffer bytes.Buffer
-	buffer.WriteString("[")
-
-	bArrayMemberAlreadyWritten := false
-	fmt.Printf("bArrayMemberAlreadyWritten := false\n")
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		if bArrayMemberAlreadyWritten == true {
-			buffer.WriteString(",")
-		}
-		fmt.Printf("resultsIterator.HasNext\n")
-		buffer.WriteString("{\"Key\":")
-		buffer.WriteString("\"")
-		buffer.WriteString(queryResponse.Key)
-		buffer.WriteString("\"")
-		buffer.WriteString(", \"Record\":")
-
-		buffer.WriteString(string(queryResponse.Value))
-		buffer.WriteString("}")
-		bArrayMemberAlreadyWritten = true
-	}
-
-	if CptyID != "All" {
-		resultsIterator2, err := APIstub.GetQueryResult(queryString2)
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-		defer resultsIterator2.Close()
-		bArrayMemberAlreadyWritten2 := false
-		for resultsIterator2.HasNext() {
-			queryResponse2, err := resultsIterator2.Next()
-			if err != nil {
-				return shim.Error(err.Error())
-			}
-
-			if bArrayMemberAlreadyWritten2 == true {
-				buffer.WriteString(",")
-			}
-			fmt.Printf("resultsIterator2.HasNext\n")
-			buffer.WriteString("{\"Key\":")
-			buffer.WriteString("\"")
-			buffer.WriteString(queryResponse2.Key)
-			buffer.WriteString("\"")
-			buffer.WriteString(", \"Record\":")
-
-			buffer.WriteString(string(queryResponse2.Value))
-			buffer.WriteString("}")
-			bArrayMemberAlreadyWritten2 = true
-		}
-	}
-	buffer.WriteString("]")
-
-	return shim.Success(buffer.Bytes())
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryCptyISDAByCpty","0001","0004"]}' -C myc
-func (s *SmartContract) queryCptyISDAByCpty(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 2 {
-		return shim.Error("Incorrect number of arguments. Expecting 2")
-	}
-	var queryString string
-	OwnCptyID := args[0]
-	CptyID := args[1]
-
-	queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"CptyISDA\",\"OwnCptyID\":\"%s\",\"CptyID\":\"%s\"}}", OwnCptyID, CptyID)
-
-	resultsIterator, err := APIstub.GetQueryResult(queryString)
-	fmt.Printf("APIstub.GetQueryResult(queryString)\n")
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	defer resultsIterator.Close()
-	fmt.Printf("esultsIterator.Close")
-
-	var buffer bytes.Buffer
-	buffer.WriteString("[")
-
-	bArrayMemberAlreadyWritten := false
-	fmt.Printf("bArrayMemberAlreadyWritten := false\n")
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		if bArrayMemberAlreadyWritten == true {
-			buffer.WriteString(",")
-		}
-		fmt.Printf("resultsIterator.HasNext\n")
-		buffer.WriteString("{\"Key\":")
-		buffer.WriteString("\"")
-		buffer.WriteString(queryResponse.Key)
-		buffer.WriteString("\"")
-		buffer.WriteString(", \"Record\":")
-
-		buffer.WriteString(string(queryResponse.Value))
-		buffer.WriteString("}")
-		bArrayMemberAlreadyWritten = true
-	}
-	buffer.WriteString("]")
-
-	return shim.Success(buffer.Bytes())
-}
-
-/*
-peer chaincode invoke -n mycc -c '{"Args":["createCptyAsset", "0001","45000000","8000000","3000000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000"]}' -C myc
-peer chaincode invoke -n mycc -c '{"Args":["createCptyAsset", "0002","45000000","8000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000","6000000"]}' -C myc
-*/
-func (s *SmartContract) createCptyAsset(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	TimeNow := time.Now().Format(timelayout)
-
-	if len(args) != 24 {
-		return shim.Error("Incorrect number of arguments. Expecting 21")
-	}
-
-	var newUSDBond, newTWDBond float64
-	var newAUD, newBRL, newCAD, newCHF, newCNY, newEUR, newGBP, newHKD, newINR, newJPY, newKRW float64
-	var newMOP, newMYR, newNZD, newPHP, newSEK, newSGD, newTHB, newTWD, newUSD, newZAR float64
-	var OwnCptyID, CptyAssetID string
-
-	OwnCptyID = args[0]
-
-	newUSDBond, err := strconv.ParseFloat(args[1], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTWDBond, err = strconv.ParseFloat(args[2], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newAUD, err = strconv.ParseFloat(args[3], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newBRL, err = strconv.ParseFloat(args[4], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCAD, err = strconv.ParseFloat(args[5], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCHF, err = strconv.ParseFloat(args[6], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCNY, err = strconv.ParseFloat(args[7], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEUR, err = strconv.ParseFloat(args[8], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newGBP, err = strconv.ParseFloat(args[9], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newHKD, err = strconv.ParseFloat(args[10], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newINR, err = strconv.ParseFloat(args[11], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newJPY, err = strconv.ParseFloat(args[12], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newKRW, err = strconv.ParseFloat(args[13], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newMOP, err = strconv.ParseFloat(args[14], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newMYR, err = strconv.ParseFloat(args[15], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newNZD, err = strconv.ParseFloat(args[16], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newPHP, err = strconv.ParseFloat(args[17], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newSEK, err = strconv.ParseFloat(args[18], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newSGD, err = strconv.ParseFloat(args[19], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTHB, err = strconv.ParseFloat(args[20], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTWD, err = strconv.ParseFloat(args[21], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSD, err = strconv.ParseFloat(args[22], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newZAR, err = strconv.ParseFloat(args[23], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	CptyAssetID = OwnCptyID + TimeNow
-	fmt.Println("createCptyAsset= " + CptyAssetID + "\n")
-
-	var CptyAsset = CptyAsset{ObjectType: "CptyAsset", CptyAssetID: CptyAssetID, OwnCptyID: OwnCptyID, USDBond: newUSDBond, TWDBond: newTWDBond, AUD: newAUD, BRL: newBRL, CAD: newCAD, CHF: newCHF, CNY: newCNY, EUR: newEUR, GBP: newGBP, HKD: newHKD, INR: newINR, JPY: newJPY, KRW: newKRW, MOP: newMOP, MYR: newMYR, NZD: newNZD, PHP: newPHP, SEK: newSEK, SGD: newSGD, THB: newTHB, TWD: newTWD, USD: newUSD, ZAR: newZAR}
-	CptyAssetAsBytes, _ := json.Marshal(CptyAsset)
-	err1 := APIstub.PutState(CptyAsset.CptyAssetID, CptyAssetAsBytes)
-	if err1 != nil {
-		return shim.Error("Failed to create state")
-		fmt.Println("createCptyAsset.PutState\n")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode invoke -n mycc -c '{"Args":["updateCptyAsset", "0001","65000000","8800000","3000000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","500000","000120181016114811"]}' -C myc
-func (s *SmartContract) updateCptyAsset(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 25 {
-		return shim.Error("Incorrect number of arguments. Expecting 25")
-	}
-
-	// 判斷是否有輸入值
-	CptyAssetAsBytes, _ := APIstub.GetState(args[24])
-	CptyAsset := CptyAsset{}
-
-	var newUSDBond, newTWDBond float64
-	var newAUD, newBRL, newCAD, newCHF, newCNY, newEUR, newGBP, newHKD, newINR, newJPY, newKRW float64
-	var newMOP, newMYR, newNZD, newPHP, newSEK, newSGD, newTHB, newTWD, newUSD, newZAR float64
-
-	newUSDBond, err := strconv.ParseFloat(args[1], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTWDBond, err = strconv.ParseFloat(args[2], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newAUD, err = strconv.ParseFloat(args[3], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newBRL, err = strconv.ParseFloat(args[4], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCAD, err = strconv.ParseFloat(args[5], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCHF, err = strconv.ParseFloat(args[6], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCNY, err = strconv.ParseFloat(args[7], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEUR, err = strconv.ParseFloat(args[8], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newGBP, err = strconv.ParseFloat(args[9], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newHKD, err = strconv.ParseFloat(args[10], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newINR, err = strconv.ParseFloat(args[11], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newJPY, err = strconv.ParseFloat(args[12], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newKRW, err = strconv.ParseFloat(args[13], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newMOP, err = strconv.ParseFloat(args[14], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newMYR, err = strconv.ParseFloat(args[15], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newNZD, err = strconv.ParseFloat(args[16], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newPHP, err = strconv.ParseFloat(args[17], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newSEK, err = strconv.ParseFloat(args[18], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newSGD, err = strconv.ParseFloat(args[19], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTHB, err = strconv.ParseFloat(args[20], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTWD, err = strconv.ParseFloat(args[21], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSD, err = strconv.ParseFloat(args[22], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newZAR, err = strconv.ParseFloat(args[23], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	json.Unmarshal(CptyAssetAsBytes, &CptyAsset)
-	CptyAsset.ObjectType = "CptyAsset"
-	CptyAsset.OwnCptyID = args[0]
-
-	CptyAsset.USDBond = newUSDBond
-	CptyAsset.TWDBond = newTWDBond
-	CptyAsset.AUD = newAUD
-	CptyAsset.BRL = newBRL
-	CptyAsset.CAD = newCAD
-	CptyAsset.CHF = newCHF
-	CptyAsset.CNY = newCNY
-	CptyAsset.EUR = newEUR
-	CptyAsset.GBP = newGBP
-	CptyAsset.HKD = newHKD
-	CptyAsset.INR = newINR
-	CptyAsset.JPY = newJPY
-	CptyAsset.KRW = newKRW
-	CptyAsset.MOP = newMOP
-	CptyAsset.MYR = newMYR
-	CptyAsset.NZD = newNZD
-	CptyAsset.PHP = newPHP
-	CptyAsset.SEK = newSEK
-	CptyAsset.SGD = newSGD
-	CptyAsset.THB = newTHB
-	CptyAsset.TWD = newTWD
-	CptyAsset.USD = newUSD
-	CptyAsset.ZAR = newZAR
-
-	CptyAssetAsBytes, _ = json.Marshal(CptyAsset)
-	err1 := APIstub.PutState(args[24], CptyAssetAsBytes)
-	if err1 != nil {
-		return shim.Error("Failed to change state")
-	}
-
-	return shim.Success(nil)
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryTXIDCptyAsset", "000120181016114811"]}' -C myc
-func (s *SmartContract) queryTXIDCptyAsset(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	CptyAssetAsBytes, _ := APIstub.GetState(args[0])
-	CptyAsset := CptyAsset{}
-	json.Unmarshal(CptyAssetAsBytes, &CptyAsset)
-
-	CptyAssetAsBytes, err := json.Marshal(CptyAsset)
-	if err != nil {
-		return shim.Error("Failed to query CptyAsset state")
-	}
-
-	return shim.Success(CptyAssetAsBytes)
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryCptyAssetStatus","0001"]}' -C myc
-func (s *SmartContract) queryCptyAssetStatus(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-	var queryString string
-	CptyID := args[0]
-	if CptyID == "All" {
-		queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"CptyAsset\"}}")
-	} else {
-		queryString = fmt.Sprintf("{\"selector\":{\"docType\":\"CptyAsset\",\"OwnCptyID\":\"%s\"}}", CptyID)
-	}
-
-	resultsIterator, err := APIstub.GetQueryResult(queryString)
-	fmt.Printf("APIstub.GetQueryResult(queryString)\n")
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	defer resultsIterator.Close()
-	fmt.Printf("esultsIterator.Close")
-
-	var buffer bytes.Buffer
-	buffer.WriteString("[")
-
-	bArrayMemberAlreadyWritten := false
-	fmt.Printf("bArrayMemberAlreadyWritten := false\n")
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		if bArrayMemberAlreadyWritten == true {
-			buffer.WriteString(",")
-		}
-		fmt.Printf("resultsIterator.HasNext\n")
-		buffer.WriteString("{\"Key\":")
-		buffer.WriteString("\"")
-		buffer.WriteString(queryResponse.Key)
-		buffer.WriteString("\"")
-		buffer.WriteString(", \"Record\":")
-
-		buffer.WriteString(string(queryResponse.Value))
-		buffer.WriteString("}")
-		bArrayMemberAlreadyWritten = true
-	}
-
-	buffer.WriteString("]")
-
-	return shim.Success(buffer.Bytes())
-}
-
-func GetOutboundIP() string {
-	itf, _ := net.InterfaceByName("ens33") //here your interface
-	item, _ := itf.Addrs()
-	var ip net.IP
-	for _, addr := range item {
-		switch v := addr.(type) {
-		case *net.IPNet:
-			if !v.IP.IsLoopback() {
-				if v.IP.To4() != nil { //Verify if IP is IPV4
-					ip = v.IP
-				}
-			}
-		}
-	}
-	if ip != nil {
-		return ip.String()
-	} else {
-		return ""
-	}
-}
-
-/*
-peer chaincode invoke -n mycc -c '{"Args":["createMTMPrice", "192.168.50.196","20181210"]}' -C myc
-*/
-func (s *SmartContract) createMTMPrice(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-	// http://127.0.0.2:8080/?datadate=20181025&curr1=USD&curr2=TWD
-	// ipaddress := GetOutboundIP()
-	// fmt.Println("getrate.GetOutboundIP= " + ipaddress + "\n")
-
-	CurrencyPair := []string{"AUDHKD", "AUDTWD", "AUDUSD", "CADHKD", "CADTWD", "CHFHKD", "CHFTWD", "CNYHKD", "CNYTWD", "EURAUD", "EURCNY", "EURGBP", "EURHKD", "EURJPY", "EURTWD", "EURUSD", "EURZAR", "GBPHKD", "GBPJPY", "GBPTWD", "GBPUSD", "HKDJPY", "HKDTWD", "JPYTWD", "MYRHKD", "MYRTWD", "NZDHKD", "NZDTWD", "NZDUSD", "PHPTWD", "SEKTWD", "SGDHKD", "SGDTWD", "THBHKD", "USDBRL", "USDCAD", "USDCHF", "USDCNH", "USDHKD", "USDINR", "USDJPY", "USDKRW", "USDMOP", "USDMYR", "USDPHP", "USDSEK", "USDSGD", "USDTHB", "USDTWD", "USDZAR", "ZARHKD", "ZARTWD"}
-	PairMTM := []string{}
-	for i := 0; i < len(CurrencyPair); i++ {
-
-		queryString := "http://" + args[0] + ":8080/?datadate=" + args[1] + "&curr1=" + SubString(CurrencyPair[i], 0, 3) + "&curr2=" + SubString(CurrencyPair[i], 3, 6)
-		//fmt.Println("getrate.queryString= " + queryString + "\n")
-		resp, err := http.Post(queryString, "application/x-www-form-urlencoded", strings.NewReader(""))
-		if err != nil {
-			fmt.Println(err)
-		}
-
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println(err)
-		}
-		fmt.Println("getrate= " + CurrencyPair[i] + "=" + string(body) + "\n")
-		//PairMTM =  append(PairMTM, strings.Replace(string(body)," ","",-1))
-		PairMTM = append(PairMTM, strings.Replace(strings.Replace(string(body), "\n", "", -1), " ", "", -1))
-	}
-
-	TXKEY := "MTMPrice" + args[1]
-
-	var newAUDHKD, newAUDTWD, newAUDUSD, newCADHKD, newCADTWD, newCHFHKD, newCHFTWD, newCNYHKD, newCNYTWD, newEURAUD float64
-	newAUDHKD, err := strconv.ParseFloat(PairMTM[0], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newAUDTWD, err = strconv.ParseFloat(PairMTM[1], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newAUDUSD, err = strconv.ParseFloat(PairMTM[2], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCADHKD, err = strconv.ParseFloat(PairMTM[3], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCADTWD, err = strconv.ParseFloat(PairMTM[4], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCHFHKD, err = strconv.ParseFloat(PairMTM[5], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCHFTWD, err = strconv.ParseFloat(PairMTM[6], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCNYHKD, err = strconv.ParseFloat(PairMTM[7], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newCNYTWD, err = strconv.ParseFloat(PairMTM[8], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEURAUD, err = strconv.ParseFloat(PairMTM[9], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	var newEURCNY, newEURGBP, newEURHKD, newEURJPY, newEURTWD, newEURUSD, newEURZAR, newGBPHKD, newGBPJPY, newGBPTWD float64
-	newEURCNY, err = strconv.ParseFloat(PairMTM[10], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEURGBP, err = strconv.ParseFloat(PairMTM[11], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEURHKD, err = strconv.ParseFloat(PairMTM[12], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEURJPY, err = strconv.ParseFloat(PairMTM[13], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEURTWD, err = strconv.ParseFloat(PairMTM[14], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEURUSD, err = strconv.ParseFloat(PairMTM[15], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newEURZAR, err = strconv.ParseFloat(PairMTM[16], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newGBPHKD, err = strconv.ParseFloat(PairMTM[17], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newGBPJPY, err = strconv.ParseFloat(PairMTM[18], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newGBPTWD, err = strconv.ParseFloat(PairMTM[19], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	var newGBPUSD, newHKDJPY, newHKDTWD, newJPYTWD, newMYRHKD, newMYRTWD, newNZDHKD, newNZDTWD, newNZDUSD, newPHPTWD float64
-	newGBPUSD, err = strconv.ParseFloat(PairMTM[20], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newHKDJPY, err = strconv.ParseFloat(PairMTM[21], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newHKDTWD, err = strconv.ParseFloat(PairMTM[22], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newJPYTWD, err = strconv.ParseFloat(PairMTM[23], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newMYRHKD, err = strconv.ParseFloat(PairMTM[24], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newMYRTWD, err = strconv.ParseFloat(PairMTM[25], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newNZDHKD, err = strconv.ParseFloat(PairMTM[26], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newNZDTWD, err = strconv.ParseFloat(PairMTM[27], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newNZDUSD, err = strconv.ParseFloat(PairMTM[28], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newPHPTWD, err = strconv.ParseFloat(PairMTM[29], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	var newSEKTWD, newSGDHKD, newSGDTWD, newTHBHKD, newUSDBRL, newUSDCAD, newUSDCHF, newUSDCNH, newUSDHKD, newUSDINR float64
-	newSEKTWD, err = strconv.ParseFloat(PairMTM[30], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newSGDHKD, err = strconv.ParseFloat(PairMTM[31], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newSGDTWD, err = strconv.ParseFloat(PairMTM[32], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newTHBHKD, err = strconv.ParseFloat(PairMTM[33], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDBRL, err = strconv.ParseFloat(PairMTM[34], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDCAD, err = strconv.ParseFloat(PairMTM[35], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDCHF, err = strconv.ParseFloat(PairMTM[36], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDCNH, err = strconv.ParseFloat(PairMTM[37], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDHKD, err = strconv.ParseFloat(PairMTM[38], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDINR, err = strconv.ParseFloat(PairMTM[39], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	var newUSDJPY, newUSDKRW, newUSDMOP, newUSDMYR, newUSDPHP, newUSDSEK, newUSDSGD, newUSDTHB, newUSDTWD, newUSDZAR float64
-	newUSDJPY, err = strconv.ParseFloat(PairMTM[40], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDKRW, err = strconv.ParseFloat(PairMTM[41], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDMOP, err = strconv.ParseFloat(PairMTM[42], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDMYR, err = strconv.ParseFloat(PairMTM[43], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDPHP, err = strconv.ParseFloat(PairMTM[44], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDSEK, err = strconv.ParseFloat(PairMTM[45], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDSGD, err = strconv.ParseFloat(PairMTM[46], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDTHB, err = strconv.ParseFloat(PairMTM[47], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDTWD, err = strconv.ParseFloat(PairMTM[48], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUSDZAR, err = strconv.ParseFloat(PairMTM[49], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-
-	var newZARHKD, newZARTWD float64
-	newZARHKD, err = strconv.ParseFloat(PairMTM[50], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newZARTWD, err = strconv.ParseFloat(PairMTM[51], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-
-	var MTMPrice = MTMPrice{ObjectType: "MTMPrice", TXKEY: TXKEY, AUDHKD: newAUDHKD, AUDTWD: newAUDTWD, AUDUSD: newAUDUSD, CADHKD: newCADHKD, CADTWD: newCADTWD, CHFHKD: newCHFHKD, CHFTWD: newCHFTWD, CNYHKD: newCNYHKD, CNYTWD: newCNYTWD, EURAUD: newEURAUD, EURCNY: newEURCNY, EURGBP: newEURGBP, EURHKD: newEURHKD, EURJPY: newEURJPY, EURTWD: newEURTWD, EURUSD: newEURUSD, EURZAR: newEURZAR, GBPHKD: newGBPHKD, GBPJPY: newGBPJPY, GBPTWD: newGBPTWD, GBPUSD: newGBPUSD, HKDJPY: newHKDJPY, HKDTWD: newHKDTWD, JPYTWD: newJPYTWD, MYRHKD: newMYRHKD, MYRTWD: newMYRTWD, NZDHKD: newNZDHKD, NZDTWD: newNZDTWD, NZDUSD: newNZDUSD, PHPTWD: newPHPTWD, SEKTWD: newSEKTWD, SGDHKD: newSGDHKD, SGDTWD: newSGDTWD, THBHKD: newTHBHKD, USDBRL: newUSDBRL, USDCAD: newUSDCAD, USDCHF: newUSDCHF, USDCNH: newUSDCNH, USDHKD: newUSDHKD, USDINR: newUSDINR, USDJPY: newUSDJPY, USDKRW: newUSDKRW, USDMOP: newUSDMOP, USDMYR: newUSDMYR, USDPHP: newUSDPHP, USDSEK: newUSDSEK, USDSGD: newUSDSGD, USDTHB: newUSDTHB, USDTWD: newUSDTWD, USDZAR: newUSDZAR, ZARHKD: newZARHKD, ZARTWD: newZARTWD}
-	MTMPriceAsBytes, _ := json.Marshal(MTMPrice)
-	err1 := APIstub.PutState(MTMPrice.TXKEY, MTMPriceAsBytes)
-	if err1 != nil {
-		return shim.Error("Failed to create state")
-		fmt.Println("createMTMPrice.PutState\n")
-	}
-
-	return shim.Success(nil)
-}
-
-/*
-peer chaincode invoke -n mycc -c '{"Args":["createBondPrice", "192.168.50.196","20181210"]}' -C myc
-*/
-func (s *SmartContract) createBondPrice(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-	// http://192.168.0.28:8080/?datadate=20181121&TWDBOND=A03108
-	ipaddress := GetOutboundIP()
-	fmt.Println("getrate.GetOutboundIP= " + ipaddress + "\n")
-
-	TWDBond := []string{"A03108", "A07110", "A00104", "A03107", "A03114"}
-	USDBond := []string{"US46625HJZ47", "US71647NAM11", "XS11335850562", "US25152RXA66", "BBG00FYBLQH5"}
-	BondMTM := []string{}
-	for i := 0; i < len(TWDBond); i++ {
-
-		queryString := "http://" + args[0] + ":8080/?datadate=" + args[1] + "&TWDBOND=" + TWDBond[i]
-		//fmt.Println("getrate.queryString= " + queryString + "\n")
-		resp, err := http.Post(queryString, "application/x-www-form-urlencoded", strings.NewReader(""))
-		if err != nil {
-			fmt.Println(err)
-		}
-
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println(err)
-		}
-		//fmt.Println("getrate= " + CurrencyPair[i] + "=" + string(body) + "\n")
-		//PairMTM =  append(PairMTM, strings.Replace(string(body)," ","",-1))
-		BondMTM = append(BondMTM, strings.Replace(strings.Replace(string(body), "\n", "", -1), " ", "", -1))
-	}
-	for i := 0; i < len(USDBond); i++ {
-
-		queryString := "http://" + args[0] + ":8080/?datadate=" + args[1] + "&USDBOND=" + USDBond[i]
-		//fmt.Println("getrate.queryString= " + queryString + "\n")
-		resp, err := http.Post(queryString, "application/x-www-form-urlencoded", strings.NewReader(""))
-		if err != nil {
-			fmt.Println(err)
-		}
-
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println(err)
-		}
-		//fmt.Println("getrate= " + CurrencyPair[i] + "=" + string(body) + "\n")
-		//PairMTM =  append(PairMTM, strings.Replace(string(body)," ","",-1))
-		BondMTM = append(BondMTM, strings.Replace(strings.Replace(string(body), "\n", "", -1), " ", "", -1))
-	}
-
-	TXKEY := "BondPrice" + args[1]
-
-	var newA03108, newA07110, newA00104, newA03107, newA03114 float64
-	newA03108, err := strconv.ParseFloat(BondMTM[0], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newA07110, err = strconv.ParseFloat(BondMTM[1], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newA00104, err = strconv.ParseFloat(BondMTM[2], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newA03107, err = strconv.ParseFloat(BondMTM[3], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newA03114, err = strconv.ParseFloat(BondMTM[4], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-
-	var newUS46625HJZ47, newUS71647NAM11, newXS11335850562, newUS25152RXA66, newBBG00FYBLQH5 float64
-	newUS46625HJZ47, err = strconv.ParseFloat(BondMTM[5], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUS71647NAM11, err = strconv.ParseFloat(BondMTM[6], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newXS11335850562, err = strconv.ParseFloat(BondMTM[7], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newUS25152RXA66, err = strconv.ParseFloat(BondMTM[8], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-	newBBG00FYBLQH5, err = strconv.ParseFloat(BondMTM[9], 64)
-	if err != nil {
-		return shim.Error(err.Error())
-	}
-
-	var BondPrice = BondPrice{ObjectType: "BondPrice", TXKEY: TXKEY, A03108: newA03108, A07110: newA07110, A00104: newA00104, A03107: newA03107, A03114: newA03114, US46625HJZ47: newUS46625HJZ47, US71647NAM11: newUS71647NAM11, XS11335850562: newXS11335850562, US25152RXA66: newUS25152RXA66, BBG00FYBLQH5: newBBG00FYBLQH5}
-	BondPriceAsBytes, _ := json.Marshal(BondPrice)
-	err1 := APIstub.PutState(BondPrice.TXKEY, BondPriceAsBytes)
-	if err1 != nil {
-		return shim.Error("Failed to create state")
-		fmt.Println("createBondPrice.PutState\n")
-	}
-
-	return shim.Success(nil)
-}
-
-func queryMTMPriceByContract(APIstub shim.ChaincodeStubInterface, TXDATE string, Contract string) float64 {
-
-	TXKEY := "MTMPrice" + TXDATE
-	queryString := fmt.Sprintf("{\"selector\":{\"docType\":\"MTMPrice\",\"TXKEY\":\"%s\"}}", TXKEY)
-
-	resultsIterator, err := APIstub.GetQueryResult(queryString)
-	fmt.Printf("APIstub.GetQueryResult" + queryString + "\n")
-	if err != nil {
-		return 0
-	}
-	defer resultsIterator.Close()
-	fmt.Printf("resultsIterator.Close")
-	transactionArr := []MTMPrice{}
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
-		if err != nil {
-			return 0
-		}
-		jsonByteObj := queryResponse.Value
-		transaction := MTMPrice{}
-		json.Unmarshal(jsonByteObj, &transaction)
-		transactionArr = append(transactionArr, transaction)
-		//var newAUDHKD, newAUDTWD, newAUDUSD, newCADHKD, newCADTWD, newCHFHKD, newCHFTWD, newCNYHKD, newCNYTWD, newEURAUD float64
-		if Contract == "AUDHKD" {
-			return transactionArr[0].AUDHKD
-		}
-		if Contract == "AUDTWD" {
-			return transactionArr[0].AUDTWD
-		}
-		if Contract == "USDTWD" {
-			return transactionArr[0].USDTWD
-		}
-		if Contract == "AUDUSD" {
-			return transactionArr[0].AUDUSD
-		}
-		if Contract == "CADHKD" {
-			return transactionArr[0].CADHKD
-		}
-		if Contract == "CHFHKD" {
-			return transactionArr[0].CHFHKD
-		}
-		if Contract == "CHFTWD" {
-			return transactionArr[0].CHFTWD
-		}
-		if Contract == "CNYHKD" {
-			return transactionArr[0].CNYHKD
-		}
-		if Contract == "CNYTWD" {
-			return transactionArr[0].CNYTWD
-		}
-		if Contract == "EURAUD" {
-			return transactionArr[0].EURAUD
-		}
-		//2
-		//var newEURCNY, newEURGBP, newEURHKD, newEURJPY, newEURTWD, newEURUSD, newEURZAR, newGBPHKD, newGBPJPY, newGBPTWD float64
-		if Contract == "EURCNY" {
-			return transactionArr[0].EURCNY
-		}
-		if Contract == "EURGBP" {
-			return transactionArr[0].EURGBP
-		}
-		if Contract == "EURHKD" {
-			return transactionArr[0].EURHKD
-		}
-		if Contract == "EURJPY" {
-			return transactionArr[0].EURJPY
-		}
-		if Contract == "EURTWD" {
-			return transactionArr[0].EURTWD
-		}
-		if Contract == "EURUSD" {
-			return transactionArr[0].EURUSD
-		}
-		if Contract == "EURZAR" {
-			return transactionArr[0].EURZAR
-		}
-		if Contract == "GBPHKD" {
-			return transactionArr[0].GBPHKD
-		}
-		if Contract == "GBPJPY" {
-			return transactionArr[0].GBPJPY
-		}
-		if Contract == "GBPTWD" {
-			return transactionArr[0].GBPTWD
-		}
-		//3
-		//var newGBPUSD, newHKDJPY, newHKDTWD, newJPYTWD, newMYRHKD, newMYRTWD, newNZDHKD, newNZDTWD, newNZDUSD, newPHPTWD float64
-		if Contract == "GBPUSD" {
-			return transactionArr[0].GBPUSD
-		}
-		if Contract == "HKDJPY" {
-			return transactionArr[0].HKDJPY
-		}
-		if Contract == "HKDTWD" {
-			return transactionArr[0].HKDTWD
-		}
-		if Contract == "JPYTWD" {
-			return transactionArr[0].JPYTWD
-		}
-		if Contract == "MYRHKD" {
-			return transactionArr[0].MYRHKD
-		}
-		if Contract == "MYRTWD" {
-			return transactionArr[0].MYRTWD
-		}
-		if Contract == "NZDHKD" {
-			return transactionArr[0].NZDHKD
-		}
-		if Contract == "NZDTWD" {
-			return transactionArr[0].NZDTWD
-		}
-		if Contract == "NZDUSD" {
-			return transactionArr[0].NZDUSD
-		}
-		if Contract == "PHPTWD" {
-			return transactionArr[0].PHPTWD
-		}
-		//4
-		//var newSEKTWD, newSGDHKD, newSGDTWD, newTHBHKD, newUSDBRL, newUSDCAD, newUSDCHF, newUSDCNH, newUSDHKD, newUSDINR float64
-		if Contract == "SEKTWD" {
-			return transactionArr[0].SEKTWD
-		}
-		if Contract == "SGDHKD" {
-			return transactionArr[0].SGDHKD
-		}
-		if Contract == "SGDTWD" {
-			return transactionArr[0].SGDTWD
-		}
-		if Contract == "THBHKD" {
-			return transactionArr[0].THBHKD
-		}
-		if Contract == "USDBRL" {
-			return transactionArr[0].USDBRL
-		}
-		if Contract == "USDCAD" {
-			return transactionArr[0].USDCAD
-		}
-		if Contract == "USDCHF" {
-			return transactionArr[0].USDCHF
-		}
-		if Contract == "USDCNH" {
-			return transactionArr[0].USDCNH
-		}
-		if Contract == "USDHKD" {
-			return transactionArr[0].USDHKD
-		}
-		if Contract == "USDINR" {
-			return transactionArr[0].USDINR
-		}
-		//5
-		//var newUSDJPY, newUSDKRW, newUSDMOP, newUSDMYR, newUSDPHP, newUSDSEK, newUSDSGD, newUSDTHB, newUSDTWD, newUSDZAR float64
-		if Contract == "USDJPY" {
-			return transactionArr[0].USDJPY
-		}
-		if Contract == "USDKRW" {
-			return transactionArr[0].USDKRW
-		}
-		if Contract == "USDMOP" {
-			return transactionArr[0].USDMOP
-		}
-		if Contract == "USDMYR" {
-			return transactionArr[0].USDMYR
-		}
-		if Contract == "USDPHP" {
-			return transactionArr[0].USDPHP
-		}
-		if Contract == "USDSEK" {
-			return transactionArr[0].USDSEK
-		}
-		if Contract == "USDSGD" {
-			return transactionArr[0].USDSGD
-		}
-		if Contract == "USDTHB" {
-			return transactionArr[0].USDTHB
-		}
-		if Contract == "USDTWD" {
-			return transactionArr[0].USDTWD
-		}
-		if Contract == "USDZAR" {
-			return transactionArr[0].USDZAR
-		}
-
-		if Contract == "ZARHKD" {
-			return transactionArr[0].ZARHKD
-		}
-		if Contract == "ZARTWD" {
-			return transactionArr[0].ZARTWD
-		}
-	}
-	return 0
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryMTMPrice","20181126"]}' -C myc
-func (s *SmartContract) queryMTMPrice(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	TXKEY := "MTMPrice" + args[0]
-	MTMPriceAsBytes, _ := APIstub.GetState(TXKEY)
-	return shim.Success(MTMPriceAsBytes)
-}
-
-//peer chaincode query -n mycc -c '{"Args":["queryBondPrice","20181126"]}' -C myc
-func (s *SmartContract) queryBondPrice(APIstub shim.ChaincodeStubInterface, args []string) peer.Response {
-
-	if len(args) != 1 {
-		return shim.Error("Incorrect number of arguments. Expecting 1")
-	}
-
-	TXKEY := "BondPrice" + args[0]
-	BondPriceAsBytes, _ := APIstub.GetState(TXKEY)
-	return shim.Success(BondPriceAsBytes)
-}
-
-// The main function is only relevant in unit test mode. Only included here for completeness.
 func main() {
-
-	// Create a new Smart Contract
 	err := shim.Start(new(SmartContract))
 	if err != nil {
-		fmt.Printf("Error creating new Smart Contract: %s", err)
+		fmt.Printf("Error starting Exchain chaincode function main(): %s", err)
+	} else {
+		fmt.Printf("Starting Exchain chaincode function main() executed successfully")
 	}
 }
 
-func msToTime(ms string) (time.Time, error) {
-	msInt, err := strconv.ParseInt(ms, 10, 64)
+//Init - The chaincode Init function: No arguments, only initializes a ID array as Index for retrieval of all Readings
+func (rdg *SmartContract) Init(stub shim.ChaincodeStubInterface) peer.Response {
+
+	//UseIDs, different LoB info and TICKETID are persistent
+
+	var readingIDs ReadingIDIndex
+	bytes, _ := stub.GetState("readingIDIndex")
+	if len(bytes) == 0 {
+		bytes, _ := json.Marshal(readingIDs)
+		stub.PutState("readingIDIndex", bytes)
+	} else {
+		stub.PutState("readingIDIndex", bytes)
+	}
+	logger.Info("Func------Init----Get readingIDIndex" + string(bytes))
+
+	var LobTemp LoB
+	iter := 0
+	for iter < NumberOfLoBs {
+		bytes, _ := stub.GetState(Lob_Name[iter])
+		if len(bytes) == 0 {
+			LobTemp.LoBID = iter
+			LobTemp.TotalCredit = 0
+			bytes, _ := json.Marshal(LobTemp)
+			stub.PutState(Lob_Name[iter], bytes)
+		} else {
+			stub.PutState(Lob_Name[iter], bytes)
+		}
+		logger.Info("Func------Init----Get LoB info" + string(bytes))
+		iter = iter + 1
+	}
+
+	indexbytes, _ := stub.GetState("TICKETID")
+	if len(indexbytes) == 0 {
+		indexbytes, _ := json.Marshal(TICKETID)
+		stub.PutState("TICKETID", indexbytes)
+	} else {
+		stub.PutState("TICKETID", indexbytes)
+	}
+	logger.Info("Func------Init----Get TICKETID" + string(indexbytes))
+
+	return shim.Success(nil)
+}
+
+//Invoke - The chaincode Invoke function:
+func (rdg *SmartContract) Invoke(stub shim.ChaincodeStubInterface) peer.Response {
+	function, args := stub.GetFunctionAndParameters()
+	logger.Info(" ****** Invoke: function: ", function)
+
+	switch function {
+	//Participant Read Delete Update Add
+	case "addParticipant":
+		return rdg.addParticipant(stub, args)
+	case "readParticipant":
+		return rdg.readParticipant(stub, args[0])
+	case "readAllParticipant":
+		return rdg.readAllParticipant(stub)
+	case "updateParticipant":
+		return rdg.updateParticipant(stub, args)
+	case "deleteParticipant":
+		return rdg.deleteParticipant(stub, args[0])
+
+	//Credit Read Delete Update Add
+	case "CreditCreate":
+		return rdg.CreditCreate(stub, args)
+	case "CreditRead":
+		return rdg.CreditRead(stub, args[0])
+	case "CreditAdd":
+		return rdg.CreditAdd(stub, args)
+	case "CreditDelete":
+		return rdg.CreditDelete(stub, args[0])
+	case "TopTenCredit":
+		return rdg.TopTenCredit(stub)
+
+	// Lob Read
+	case "LoBReadAll":
+		return rdg.LoBReadAll(stub)
+	case "LoBRead":
+		return rdg.LoBRead(stub, args[0])
+
+	//Ticket Read Delete Update Add
+	case "TicketCreate":
+		return rdg.TicketCreate(stub, args)
+	case "TicketRead":
+		return rdg.TicketRead(stub, args[0])
+	case "TicketRead2":
+		return rdg.TicketRead2(stub)
+	case "TicketUpdate":
+		return rdg.TicketUpdate(stub, args)
+	case "AutoUpdateTicketStatus":
+		return rdg.AutoUpdateTicketStatus(stub, args[0])
+	case "TicketDelete":
+		return rdg.TicketDelete(stub, args[0])
+
+	//Order Read Delete Update Add
+	case "OrderCreate":
+		return rdg.OrderCreate(stub, args)
+	//Read Single  It must be changed
+	case "OrderRead":
+		return rdg.OrderRead(stub, args)
+	//Read All  It must be changed
+	case "OrderRead2":
+		return rdg.OrderRead2(stub, args)
+	case "OrderUpdate":
+		return rdg.OrderUpdate(stub, args)
+
+		//Get HistoryTicket
+	case "history":
+		return rdg.TestGetHistoryTicket(stub, args)
+	default:
+		logger.Error("Received unknown function invocation: ", function)
+	}
+	return shim.Error("Received unknown function invocation")
+}
+
+//getReadingFromArgs - construct a reading structure from string array of arguments
+func getParticipantFromArgs(args []string) (participant Participant, err error) {
+	//check inputs!
+	//  json:"Participant_UserID"
+	//  json:"Participant_UserName"
+	//  json:"Participant_Password"
+	//  json:"Participant_IsAdmin"
+	//  json:"Participant_LoB"
+	if strings.Contains(args[0], "\"Participant_UserName\"") == false ||
+		strings.Contains(args[0], "\"Participant_UserID\"") == false ||
+		strings.Contains(args[0], "\"Participant_Password\"") == false ||
+		strings.Contains(args[0], "\"Participant_IsAdmin\"") == false ||
+		strings.Contains(args[0], "\"Participant_LoBID\"") == false {
+		return participant, errors.New("Unknown field: Input JSON does not comply to schema")
+	}
+
+	err = json.Unmarshal([]byte(args[0]), &participant)
 	if err != nil {
-		return time.Time{}, err
+		return participant, err
 	}
-
-	return time.Unix(msInt/millisPerSecond,
-		(msInt%millisPerSecond)*nanosPerMillisecond), nil
+	return participant, nil
 }
 
-func generateMaturity(issueDate string, years int, months int, days int) (string, error) {
+//Invoke Route: addNewReading
+func (rdg *SmartContract) addParticipant(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	//get Participant
+	participant, err := getParticipantFromArgs(args)
+	logger.Info("Func------addParticipant----Participant.LoBID" + string(participant.LoBID))
 
-	t, err := msToTime(makeTimestamp(issueDate))
 	if err != nil {
-		return "", err
+		return shim.Error("Reading participant is Corrupted")
+	}
+	//check Participant exists or not
+	record, err := stub.GetState(participant.UserID)
+	if record != nil {
+		return shim.Error("This participant already exists: " + participant.UserID)
 	}
 
-	maturityDate := t.AddDate(years, months, days)
-	sDate := maturityDate.Format(layout)
-	return sDate, nil
-
-}
-
-func makeTimestamp(aDate string) string {
-	var stamp int64
-	t, _ := time.Parse(layout, aDate)
-	stamp = t.UnixNano() / int64(time.Millisecond)
-	str := strconv.FormatInt(stamp, 10)
-	return str
-}
-
-func getDateUnix(mydate string) int64 {
-	tm2, _ := time.Parse(layout, mydate)
-	return tm2.Unix()
-}
-
-func daySub(d1, d2 string) float64 {
-	t1, _ := time.Parse(layout, d1)
-	t2, _ := time.Parse(layout, d2)
-	return float64(timeSub(t2, t1))
-}
-
-func timeSub(t1, t2 time.Time) int {
-	t1 = t1.UTC().Truncate(24 * time.Hour)
-	t2 = t2.UTC().Truncate(24 * time.Hour)
-	return int(t1.Sub(t2).Hours() / 24)
-}
-
-func SubString(str string, begin, length int) (substr string) {
-	// 將字串轉成[]rune
-	rs := []rune(str)
-	lth := len(rs)
-
-	// 範圍判断
-	if begin < 0 {
-		begin = 0
-	}
-	if begin >= lth {
-		begin = lth
-	}
-	end := begin + length
-	if end > lth {
-		end = lth
+	//if not exists, save
+	participantAsBytes, err := rdg.saveParticipant(stub, participant)
+	if err != nil {
+		return shim.Error(err.Error())
 	}
 
-	// 返回字串
-	return string(rs[begin:end])
-}
-
-func UnicodeIndex(str, substr string) int {
-	// 子字串在字串的位置
-	result := strings.Index(str, substr)
-	if result >= 0 {
-		// 取得子字串之前的字串並轉換成[]byte
-		prefix := []byte(str)[0:result]
-		// 將字串轉換成[]rune
-		rs := []rune(string(prefix))
-		// 取得rs的長度，即子字串在字串的位置
-		result = len(rs)
+	err = CreditInit(stub, participant.UserID, 0)
+	if err != nil {
+		return shim.Error(err.Error())
 	}
 
-	return result
+	// updata LoB UserIDs array
+	_, err = rdg.updateLoBUsers(stub, participant)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	// update the ID index of
+	_, err = rdg.updateReadingIDIndex(stub, participant)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	return shim.Success(participantAsBytes)
 }
 
-func round(v float64, decimals int) float64 {
-	var pow float64 = 1
-	for i := 0; i < decimals; i++ {
-		pow *= 10
+//Helper: Save purchaser
+func (rdg *SmartContract) saveParticipant(stub shim.ChaincodeStubInterface, participant Participant) ([]byte, error) {
+	bytes, err := json.Marshal(participant)
+	if err != nil {
+		return bytes, errors.New("Error converting reading record JSON")
 	}
-	return float64(int((v*pow)+0.5)) / pow
+	err = stub.PutState(participant.UserID, bytes)
+	if err != nil {
+		return bytes, errors.New("Error storing Reading record")
+	}
+	return bytes, nil
+}
+
+//Helper: add user to its LoB's UserIDs array
+func (rdg *SmartContract) updateLoBUsers(stub shim.ChaincodeStubInterface, participant Participant) (bool, error) {
+
+	var LoB_temp LoB
+
+	LobName := Lob_Name[participant.LoBID]
+	bytes, err := stub.GetState(LobName)
+	if err != nil {
+		return false, errors.New("updateLoBUsers: Error getting LoB info from state")
+	}
+
+	err = json.Unmarshal(bytes, &LoB_temp)
+	if err != nil {
+		return false, errors.New("updateLoBUsers: Error unmarshalling LoB JSON")
+	}
+
+	// To do: participant credit
+	LoB_temp.LoBID = participant.LoBID
+	LoB_temp.UserIDs = append(LoB_temp.UserIDs, participant.UserID)
+
+	bytes, err = json.Marshal(LoB_temp)
+	if err != nil {
+		return false, errors.New("updateLoBUsers: Error marshalling new LoB info")
+	}
+
+	err = stub.PutState(LobName, bytes)
+	if err != nil {
+		return false, errors.New("updateLoBUsers: Error storing new LoB info")
+	}
+	return true, nil
+}
+
+//Helper: Update reading Holder - updates Index
+func (rdg *SmartContract) updateReadingIDIndex(stub shim.ChaincodeStubInterface, participant Participant) (bool, error) {
+	var participantIDs ReadingIDIndex
+	bytes, err := stub.GetState("readingIDIndex")
+	if err != nil {
+		return false, errors.New("updateReadingIDIndex: Error getting readingIDIndex array Index from state")
+	}
+	logger.Info("Func------updateReadingIDIndex----Get readingIDIndex" + string(bytes))
+
+	err = json.Unmarshal(bytes, &participantIDs)
+	if err != nil {
+		return false, errors.New("updateReadingIDIndex: Error unmarshalling readingIDIndex array JSON")
+	}
+	//Add participant.UserID
+	logger.Info("Func------updateReadingIDIndex----Get participantID" + participant.UserID)
+	participantIDs.UserIDs = append(participantIDs.UserIDs, participant.UserID)
+	bytes, err = json.Marshal(participantIDs)
+	logger.Info("Func------updateReadingIDIndex----json.Marshal(participantIDs)" + string(bytes))
+	if err != nil {
+		return false, errors.New("updateReadingIDIndex: Error marshalling new participant ID")
+	}
+
+	err = stub.PutState("readingIDIndex", bytes)
+	if err != nil {
+		return false, errors.New("updateReadingIDIndex: Error storing new participant ID in readingIDIndex (Index)")
+	}
+	return true, nil
+}
+
+//Query Route: readReading
+func (rdg *SmartContract) readParticipant(stub shim.ChaincodeStubInterface, participantID string) peer.Response {
+	participantAsByteArray, err := rdg.retrieveParticipant(stub, participantID)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	return shim.Success(participantAsByteArray)
+}
+
+//Helper: Retrieve purchaser
+//retrieve Participant
+func (rdg *SmartContract) retrieveParticipant(stub shim.ChaincodeStubInterface, participantID string) ([]byte, error) {
+	var participant Participant
+	var participantAsByteArray []byte
+	bytes, err := stub.GetState(participantID)
+
+	if err != nil {
+		return participantAsByteArray, errors.New("retrieveParticipant: Error retrieving participant with ID: " + participantID)
+	}
+	err = json.Unmarshal(bytes, &participant)
+	if err != nil {
+		return participantAsByteArray, errors.New("retrieveParticipant: Corrupt reading record " + string(bytes))
+	}
+	participantAsByteArray, err = json.Marshal(participant)
+	if err != nil {
+		return participantAsByteArray, errors.New("readParticipant: Invalid participant Object - Not a valid JSON")
+	}
+	return participantAsByteArray, nil
+}
+
+//Query Route: readAllReadings
+func (rdg *SmartContract) readAllParticipant(stub shim.ChaincodeStubInterface) peer.Response {
+	var readingIDs ReadingIDIndex
+	bytes, err := stub.GetState("readingIDIndex")
+	if err != nil {
+		return shim.Error("readAllReadings: Error getting readingIDIndex array")
+	}
+	logger.Info("Func------readAllParticipant----Get readingIDIndex" + string(bytes))
+	err = json.Unmarshal(bytes, &readingIDs)
+	if err != nil {
+		return shim.Error("readAllReadings: Error unmarshalling readingIDIndex array JSON")
+	}
+	result := "["
+
+	var readingAsByteArray []byte
+
+	for _, participantID := range readingIDs.UserIDs {
+		readingAsByteArray, err = rdg.retrieveParticipant(stub, participantID)
+		if err != nil {
+			return shim.Error("Failed to retrieve participant with ID: " + participantID)
+		}
+		result += string(readingAsByteArray) + ","
+	}
+	if len(result) == 1 {
+		result = "[]"
+	} else {
+		result = result[:len(result)-1] + "]"
+	}
+	return shim.Success([]byte(result))
+}
+
+//Helper: Reading readingStruct //change template
+func (rdg *SmartContract) deleteParticipant(stub shim.ChaincodeStubInterface, participantID string) peer.Response {
+	_, err := rdg.retrieveParticipant(stub, participantID)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	err = stub.DelState(participantID)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	_, err = rdg.deleteReadingIDIndex(stub, participantID)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	return shim.Success(nil)
+}
+
+//Helper: delete ID from readingStruct Holder
+func (rdg *SmartContract) deleteReadingIDIndex(stub shim.ChaincodeStubInterface, participantID string) (bool, error) {
+	var participantIDs ReadingIDIndex
+	bytes, err := stub.GetState("readingIDIndex")
+	if err != nil {
+		return false, errors.New("deleteReadingIDIndex: Error getting readingIDIndex array Index from state")
+	}
+	err = json.Unmarshal(bytes, &participantIDs)
+	if err != nil {
+		return false, errors.New("deleteReadingIDIndex: Error unmarshalling readingIDIndex array JSON")
+	}
+	participantIDs.UserIDs, err = deleteKeyFromStringArray(participantIDs.UserIDs, participantID)
+	if err != nil {
+		return false, errors.New(err.Error())
+	}
+	bytes, err = json.Marshal(participantIDs)
+	if err != nil {
+		return false, errors.New("deleteReadingIDIndex: Error marshalling new readingStruct ID")
+	}
+	err = stub.PutState("readingIDIndex", bytes)
+	if err != nil {
+		return false, errors.New("deleteReadingIDIndex: Error storing new readingStruct ID in readingIDIndex (Index)")
+	}
+	return true, nil
+}
+
+//deleteKeyFromArray
+func deleteKeyFromStringArray(array []string, key string) (newArray []string, err error) {
+	for _, entry := range array {
+		if entry != key {
+			newArray = append(newArray, entry)
+		}
+	}
+	if len(newArray) == len(array) {
+		return newArray, errors.New("Specified Key: " + key + " not found in Array")
+	}
+	return newArray, nil
+}
+
+//Invoke Route: updateParticipant
+func (rdg *SmartContract) updateParticipant(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+
+	var currParticipant Participant
+	newParticipant, err := getParticipantFromArgs(args)
+	participantAsByteArray, err := rdg.retrieveParticipant(stub, newParticipant.UserID)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	err = json.Unmarshal(participantAsByteArray, &currParticipant)
+	if err != nil {
+		return shim.Error("updateReading: Error unmarshalling readingStruct array JSON")
+	}
+
+	_, err = rdg.saveParticipant(stub, newParticipant)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	return shim.Success(nil)
+}
+
+func (rdg *SmartContract) CreditCreate(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+
+	// ==== Check whether the participant already exsites. ====
+	// todo
+	// checke wether credit already exsites.
+	record, err := stub.GetState("Credit_UerID_" + args[0])
+
+	if record != nil {
+		return shim.Error("This Credit" + args[0] + " credit has already existed.")
+	}
+
+	userID := args[0]
+	value, err := strconv.Atoi(args[1])
+
+	err = CreditInit(stub, userID, value)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	return shim.Success(nil)
+}
+
+func CreditInit(stub shim.ChaincodeStubInterface, userID string, value int) error {
+	var credit Credit
+
+	// ==== Create Credit object and Credit to JSON ====
+	credit = Credit{UserID: userID, Value: value}
+
+	creditAsByteArray, err := json.Marshal(credit)
+	if err != nil {
+		return errors.New(err.Error())
+	}
+
+	// ==== Save Credit to state ====
+	err = stub.PutState("Credit_UerID_"+userID, creditAsByteArray)
+	if err != nil {
+		return errors.New(err.Error())
+	}
+
+	return nil
+}
+
+func (rdg *SmartContract) CreditRead(stub shim.ChaincodeStubInterface, UserID string) peer.Response {
+	//to do
+	creditAsByteArray, err := retrieveSingleCreditAsByteArray(stub, "Credit_UerID_"+UserID)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	return shim.Success(creditAsByteArray)
+}
+
+func retrieveSingleCredit(stub shim.ChaincodeStubInterface, creditID string) (Credit, error) {
+	var credit Credit
+	var creditAsByteArray []byte
+	var err error
+
+	creditAsByteArray, err = stub.GetState(creditID)
+
+	if err != nil {
+		return credit, errors.New("CreditRead: Error credit read participant with ID: " + creditID)
+	}
+	// else if creditAsBytes == nil {
+	//  logger.Error("CreditRead:  Corrupt reading record ", err.Error())
+	//  return nil, errors.New("CreditRead: Credit does not exist " + creditID)
+	// }
+
+	// For log printing credit Information & check whether the credit does exist
+	err = json.Unmarshal(creditAsByteArray, &credit)
+	if err != nil {
+		return credit, errors.New("CreditRead: Credit does not exist " + string(creditAsByteArray))
+	}
+	// For log printing credit Information
+
+	return credit, nil
+}
+
+func retrieveSingleCreditAsByteArray(stub shim.ChaincodeStubInterface, creditID string) ([]byte, error) {
+	var credit Credit
+	var creditAsByteArray []byte
+	var err error
+
+	logger.Info("-----retrieveSingleCreditAsByteArray :creditID---------", creditID)
+	creditAsByteArray, err = stub.GetState(creditID)
+
+	if err != nil {
+		return nil, errors.New("CreditRead: Error credit read participant with ID: " + creditID)
+	}
+	// else if creditAsBytes == nil {
+	//  logger.Error("CreditRead:  Corrupt reading record ", err.Error())
+	//  return nil, errors.New("CreditRead: Credit does not exist " + creditID)
+	// }
+
+	// For log printing credit Information & check whether the credit does exist
+	err = json.Unmarshal(creditAsByteArray, &credit)
+	if err != nil {
+		return nil, errors.New("CreditRead: Credit does not exist " + string(creditAsByteArray))
+	}
+	// For log printing credit Information
+
+	logger.Info("-----retrieveSingleCreditAsByteArray---------", credit)
+
+	return creditAsByteArray, nil
+}
+
+func (rdg *SmartContract) CreditAdd(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	var credit Credit
+	var raw map[string]interface{}
+
+	err := json.Unmarshal([]byte(args[0]), &raw)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	// ==== Assign value to variable ====
+	userID := raw["userID"].(string)
+	logger.Info("*****CreditUpdate*******", userID)
+
+	value := int(raw["value"].(float64))
+	logger.Info("*****CreditUpdate*******", value)
+
+	ticketID := raw["ticketID"].(string)
+	logger.Info("*****CreditUpdate*******", ticketID)
+
+	// === Check whether the credit already exist. ====
+	creditAsByteArray, err := stub.GetState("Credit_UerID_" + userID)
+	if err != nil {
+		return shim.Error("CreditUpdate: Failed to get credit :" + err.Error())
+	} else if creditAsByteArray == nil {
+		errs := fmt.Sprintf("CreditUpdate: Credit_UerID_%s does not exist.", userID)
+		logger.Info(" ****** " + errs)
+		return shim.Error(errs)
+	}
+
+	err = json.Unmarshal(creditAsByteArray, &credit)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	// === if ticket is a constan string which only represent add constant credit ===
+	if ticketID != "creditADD" {
+		// === check whether the ticket has been add ===
+		if ok := Is_Inarray(credit.TicketIDs, ticketID); ok {
+			return shim.Error("CreditUpdate: This ticket has been existed.")
+		}
+	}
+
+	credit.Value += value
+	credit.TicketIDs = append(credit.TicketIDs, ticketID)
+
+	creditAsByteArray, err = json.Marshal(credit)
+	if err != nil {
+		return shim.Error("CreditUpdate: " + err.Error())
+	}
+
+	err = stub.PutState("Credit_UerID_"+credit.UserID, creditAsByteArray)
+	return shim.Success(creditAsByteArray)
+}
+
+func Is_Inarray(target []string, now string) bool {
+	for _, entry := range target {
+		if entry == now {
+			return true
+		}
+	}
+	return false
+}
+
+func (rdg *SmartContract) CreditDelete(stub shim.ChaincodeStubInterface, userID string) peer.Response {
+	logger.Info(" ****** CreditDelete start ****** userID:" + userID)
+	err := stub.DelState("Credit_UerID_" + userID)
+	if err != nil {
+		return shim.Error("CreditDelete: Failed to delete Credit state: " + err.Error())
+	}
+
+	//Log process for debug
+	credit, err := stub.GetState("Credit_UerID_" + userID)
+	logger.Info(" ****** CreditDelete ****** " + string(credit))
+
+	return shim.Success(nil)
+}
+
+func (rdg *SmartContract) LoBReadAll(stub shim.ChaincodeStubInterface) peer.Response {
+	var LoB_temp LoB
+	var result string
+
+	result += "["
+
+	iter := 0
+	for iter < NumberOfLoBs {
+		bytes, err := stub.GetState(Lob_Name[iter])
+		if err != nil {
+			return shim.Error("LoBReadAll: Error getting LoB info from state")
+		}
+
+		err = json.Unmarshal(bytes, &LoB_temp)
+		if err != nil {
+			return shim.Error("LoBReadAll: Error unmarshalling LoB JSON")
+		}
+
+		LobAssest := LoB{LoBID: LoB_temp.LoBID, TotalCredit: LoB_temp.TotalCredit}
+		LobAssestAsByteArray, err := json.Marshal(LobAssest)
+		if err != nil {
+			return shim.Error("LoBReadAll: Fail to Marshall LobAssest")
+		}
+		result += string(LobAssestAsByteArray) + ","
+		iter = iter + 1
+	}
+
+	result = result[:len(result)-1] + "]"
+
+	return shim.Success([]byte(result))
+}
+
+func (rdg *SmartContract) LoBRead(stub shim.ChaincodeStubInterface, LoBid string) peer.Response {
+	var LoB_temp LoB
+	var participant_temp Participant
+	var participantAsByteArray []byte
+	var credit_temp Credit
+	var result string
+
+	LoBID, _ := strconv.Atoi(LoBid)
+	if LoBID < 0 || LoBID >= NumberOfLoBs {
+		return shim.Error("Input LoBID is invalid, LoBID")
+	}
+
+	LobName := Lob_Name[LoBID]
+	bytes, err := stub.GetState(LobName)
+	if err != nil {
+		return shim.Error("LoBRead: Error getting LoB info from state")
+	}
+
+	err = json.Unmarshal(bytes, &LoB_temp)
+	if err != nil {
+		return shim.Error("LoBRead: Error unmarshalling LoB JSON")
+	}
+
+	result += "["
+	credit := strconv.Itoa(LoB_temp.TotalCredit)
+	result += "TotalCredit: " + credit + ","
+
+	for _, participantID := range LoB_temp.UserIDs {
+		participantAsByteArray, err = rdg.retrieveParticipant(stub, participantID)
+		if err != nil {
+			return shim.Error("Failed to retrieve participant with ID: " + participantID)
+		}
+
+		err = json.Unmarshal(participantAsByteArray, &participant_temp)
+		if err != nil {
+			return shim.Error("LoBRead: Error unmarshalling Participant JSON")
+		}
+
+		credit_temp, _ = retrieveSingleCredit(stub, "Credit_UerID_"+participant_temp.UserID)
+
+		Participant_UserID := "{\"participant_UserID\": " + participant_temp.UserID + ","
+		Participant_UserName := "\"participant_UserName\": " + participant_temp.UserName + ","
+		Participant_credit := "\"participant_credit\": " + strconv.Itoa(credit_temp.Value) + ","
+		Participant_LoB := "\"participant_LoB\": " + strconv.Itoa(participant_temp.LoBID) + "},"
+		result += Participant_UserID + Participant_UserName + Participant_credit + Participant_LoB
+	}
+	if len(result) == 1 {
+		result = "[]"
+	} else {
+		result = result[:len(result)-1] + "\n]"
+	}
+	return shim.Success([]byte(result))
+}
+
+func (rdg *SmartContract) TopTenCredit(stub shim.ChaincodeStubInterface) peer.Response {
+	var readingIDs ReadingIDIndex
+	var participant_temp Participant
+	var credits Credits
+	var credit_temp Credit
+	var participantAsBytes []byte
+	var err error
+	var result string
+
+	result += "["
+
+	bytes, _ := stub.GetState("readingIDIndex")
+	err = json.Unmarshal(bytes, &readingIDs)
+	if err != nil {
+		return shim.Error("TopTenCredit: Error unmarshalling readingIDIndex array JSON")
+	}
+
+	for _, participantID := range readingIDs.UserIDs {
+		credit_temp, _ = retrieveSingleCredit(stub, "Credit_UerID_"+participantID)
+		credits = append(credits, credit_temp)
+	}
+
+	sort.Sort(credits)
+
+	for i := 0; i < Min(10, len(credits)); i++ {
+		participantAsBytes, _ = rdg.retrieveParticipant(stub, credits[i].UserID)
+		err = json.Unmarshal(participantAsBytes, &participant_temp)
+		if err != nil {
+			return shim.Error("TopTenParticipant: Error unmarshalling Participant JSON")
+		}
+
+		Participant_UserID := "{\"participant_UserID\": \"" + participant_temp.UserID + "\","
+		Participant_UserName := "\"participant_UserName\": \"" + participant_temp.UserName + "\","
+		Participant_credit := "\"participant_credit\": " + strconv.Itoa(credits[i].Value) + ","
+		Participant_LoB := "\"participant_LoB\": " + strconv.Itoa(participant_temp.LoBID) + "},"
+		result += Participant_UserID + Participant_UserName + Participant_credit + Participant_LoB
+	}
+
+	if len(result) == 1 {
+		result = "[]"
+	} else {
+		result = result[:len(result)-1] + "\n]"
+	}
+	return shim.Success([]byte(result))
+}
+
+// go lib doesn't have Min/Max(int, int) funct
+func Min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
+}
+
+func getTicketFromArgs(args string) (ticket Ticket, err error) {
+	if strings.Contains(args, "\"Ticket_Title\"") == false ||
+		strings.Contains(args, "\"Ticket_Value\"") == false ||
+		strings.Contains(args, "\"Ticket_UserID\"") == false ||
+		strings.Contains(args, "\"Ticket_Type\"") == false {
+		return ticket, errors.New("Unknown field: Input JSON does not comly to schema")
+	}
+
+	err = json.Unmarshal([]byte(args), &ticket)
+	if err != nil {
+		return ticket, err
+	}
+
+	return ticket, nil
+}
+
+func saveTicket(stub shim.ChaincodeStubInterface, ticket Ticket) ([]byte, error) {
+	var ticketAsBytes []byte
+	ticketAsBytes, err := json.Marshal(ticket)
+	if err != nil {
+		return ticketAsBytes, errors.New("saveTicket: " + err.Error())
+	}
+	err = stub.PutState(ticket.TicketID, ticketAsBytes)
+	if err != nil {
+		return ticketAsBytes, err
+	}
+	return ticketAsBytes, nil
+}
+
+func (sc *SmartContract) TicketCreate(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	// ==== Get ticket from args ====
+	// todo
+	// ticket := Ticket{
+	// 	TicketID: "ticket_1",
+	// 	Status: 0,
+	// 	Title: "The first Ticket",
+	// 	Value: 30,
+	// 	UserID: "1",
+	// 	DeadLine: time.Now()}
+
+	ticket, err := getTicketFromArgs(args[0])
+
+	TICKETIDAsBytes, _ := stub.GetState("TICKETID")
+	TICKETID, _ = strconv.Atoi(string(TICKETIDAsBytes))
+	TICKETID++
+	ticket.TicketID = strconv.Itoa(TICKETID)
+	ticket.Status = 1
+	if err != nil {
+		return shim.Error("TicketCreate: " + err.Error())
+	}
+
+	// ==== Judge if the ticket already exists ====
+	// ticketAsBytes, err := stub.GetState(ticket.TicketID)
+	// if ticketAsBytes != nil {
+	// 	return shim.Error("TicketCreate: The ticket already exists." + string(ticketAsBytes))
+	// }
+	// todo
+	// check if userid is valid
+
+	// ==== Put the ticket into ledger ====
+	ticketAsBytes, err := saveTicket(stub, ticket)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	TICKETIDAsBytes, _ = json.Marshal(TICKETID)
+	stub.PutState("TICKETID", TICKETIDAsBytes)
+	return shim.Success(ticketAsBytes)
+}
+
+func (sc *SmartContract) TicketDelete(stub shim.ChaincodeStubInterface, ticketID string) peer.Response {
+	// ==== Judge if the ticket already exists ====
+	var ticket Ticket
+	ticketAsBytes, err := stub.GetState(ticketID)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	err = json.Unmarshal(ticketAsBytes, &ticket)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	logger.Info(" ****** TicketDelete:", ticket)
+
+	err = stub.DelState(ticketID)
+	return shim.Success(nil)
+}
+
+func (sc *SmartContract) TicketUpdate(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	// ==== Get ticket from args ====
+	// todo
+	// ticket := Ticket{
+	// 	TicketID: "ticket_1",
+	// 	Status: 1,
+	// 	Title: "The first Ticket 1111",
+	// 	Value: 20,
+	// 	UserID: "111",
+	// 	DeadLine: time.Now()}
+
+	// participantID := args[0]
+	ticket, err := getTicketFromArgs(args[0])
+	if err != nil {
+		return shim.Error("TicketUpdate: " + err.Error())
+	}
+	// ==== Judge if the ticket already exists ====
+	ticketAsBytes, err := stub.GetState(ticket.TicketID)
+	if ticketAsBytes == nil {
+		return shim.Error("TicketCreate: The ticket does not exist.")
+	}
+
+	// if participantID != ticket.UserID {
+	// 	return shim.Error("TicketUpdate: You have no rights to update the ticket")
+	// }
+
+	// ==== Update the ledger ====
+	ticketAsBytes, err = saveTicket(stub, ticket)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	return shim.Success(ticketAsBytes)
+}
+
+func (sc *SmartContract) TicketRead(stub shim.ChaincodeStubInterface, args string) peer.Response {
+	// ==== Read ticket from ledger ====
+	var ticket Ticket
+	ticketAsBytes, err := stub.GetState(args)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	err = json.Unmarshal(ticketAsBytes, &ticket)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+	logger.Info(" ****** TicketRead:", ticket)
+	return shim.Success(ticketAsBytes)
+}
+
+func (sc *SmartContract) TicketRead2(stub shim.ChaincodeStubInterface) peer.Response {
+	TICKETIDAsBytes, _ := stub.GetState("TICKETID")
+	TICKETID, _ = strconv.Atoi(string(TICKETIDAsBytes))
+
+	var buffer bytes.Buffer
+	buffer.WriteString("[")
+	bArrayMemberAlreadyWritten := false
+
+	i := 1
+	//var ticket Ticket
+
+	for i <= TICKETID {
+		if bArrayMemberAlreadyWritten == true {
+			buffer.WriteString(",")
+		}
+		//TicketArray = append(TicketArray, strconv.Itoa(i))
+		//TicketIDs = strconv.Itoa(i)
+		ticketAsBytes, _ := stub.GetState(strconv.Itoa(i))
+		//item, _ := json.Marshal(sc.TicketRead(stub, strconv.Itoa(i)))
+		// Record is a JSON object, so we write as-is
+		buffer.WriteString(string(ticketAsBytes))
+		bArrayMemberAlreadyWritten = true
+		i = i + 1
+	}
+	buffer.WriteString("]")
+	return shim.Success(buffer.Bytes())
+}
+
+func (sc *SmartContract) TestGetHistoryTicket(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	ticketInterator, err := stub.GetHistoryForKey("xxx1")
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	// defer ticketInterator.Close()
+
+	for ticketInterator.HasNext() {
+		queryResponse, err := ticketInterator.Next()
+		if err != nil {
+			return shim.Error(err.Error())
+		}
+
+		logger.Info("------Test----" + queryResponse.String())
+		item, _ := json.Marshal(queryResponse)
+		logger.Info("------Test 1----" + string(item))
+
+	}
+
+	return shim.Success(nil)
+}
+
+func (sc *SmartContract) OrderCreate(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	// json ticketID & userID
+	//
+
+	var order Order
+	if strings.Contains(args[0], "\"TicketID\"") == false ||
+		strings.Contains(args[0], "\"UserID\"") == false {
+		return shim.Error("OrderCreate:Unknown field: Input JSON does not comly to schema")
+	}
+
+	err := json.Unmarshal([]byte(args[0]), &order)
+	if err != nil {
+		return shim.Error("OrderCreate:")
+	}
+	ticketID := order.TicketID
+	userID := order.UserID
+
+	key, _ := stub.CreateCompositeKey("Order", []string{ticketID, userID})
+	logger.Info("------OrderCreate:" + key)
+
+	// ==== check whether the order already exsit ====
+	orderAsByte, _ := stub.GetState(key)
+	if orderAsByte != nil {
+		return shim.Error("OrderCreate: You have applied this Ticket")
+	}
+
+	order.Status = 1
+	orderAsByte, _ = json.Marshal(order)
+	stub.PutState(key, orderAsByte)
+
+	return shim.Success(orderAsByte)
+}
+
+func (sc *SmartContract) OrderRead(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	ticketID := args[0]
+	userID := args[1]
+
+	logger.Info("OrderRead :", ticketID, userID)
+	key, _ := stub.CreateCompositeKey("Order", []string{ticketID, userID})
+	orderAsByte, _ := stub.GetState(key)
+
+	logger.Info("OrderRead orderAsByte:", orderAsByte)
+	var order Order
+	_ = json.Unmarshal(orderAsByte, &order)
+
+	logger.Info("OrderRead order:", order)
+
+	return shim.Success(orderAsByte)
+}
+
+func (sc *SmartContract) OrderRead2(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	ticketID := args[0]
+
+	orderInterator, _ :=
+		stub.GetStateByPartialCompositeKey("Order", []string{ticketID})
+
+	var buffer bytes.Buffer
+	buffer.WriteString("[")
+	bArrayMemberAlreadyWritten := false
+
+	logger.Info("OrderRead2 Interator start:")
+	for orderInterator.HasNext() {
+		queryResponse, err := orderInterator.Next()
+		logger.Info("OrderRead2 Interator :", queryResponse)
+		if err != nil {
+			return shim.Error(err.Error())
+		}
+
+		logger.Info("------Test----" + queryResponse.String())
+		item, _ := json.Marshal(queryResponse)
+		logger.Info("------Test x----" + string(item))
+
+		if bArrayMemberAlreadyWritten == true {
+			buffer.WriteString(",")
+		}
+
+		// Record is a JSON object, so we write as-is
+		buffer.WriteString(string(queryResponse.Value))
+		bArrayMemberAlreadyWritten = true
+
+	}
+	buffer.WriteString("]")
+
+	return shim.Success(buffer.Bytes())
+}
+
+func OrderSaving(stub shim.ChaincodeStubInterface, order Order) ([]byte, error) {
+	bytes, err := json.Marshal(order)
+	if err != nil {
+		return nil, err
+	}
+	key, _ := stub.CreateCompositeKey(
+		"Order",
+		[]string{order.TicketID, order.UserID})
+
+	err = stub.PutState(key, bytes)
+	if err != nil {
+		return nil, err
+	}
+	return bytes, nil
+}
+
+func OrderBlukUpdate(stub shim.ChaincodeStubInterface, ticketID interface{}, userID_array []interface{}, status int) (bool, error) {
+	for _, userID := range userID_array {
+		order := Order{
+			TicketID: ticketID.(string),
+			UserID:   userID.(string),
+			Status:   status}
+		if status != 0 {
+			key, _ := stub.CreateCompositeKey("Order", []string{ticketID.(string), userID.(string)})
+			orderAsByte, _ := stub.GetState(key)
+
+			var order Order
+			_ = json.Unmarshal(orderAsByte, &order)
+
+			if order.Status == status-1 {
+				order.Status = status
+				OrderSaving(stub, order)
+			}
+		} else {
+			order.Status = status
+			OrderSaving(stub, order)
+		}
+	}
+	return true, nil
+}
+
+func orderStatueEqual(stub shim.ChaincodeStubInterface, ticketID string, userID string, status int) bool {
+	key, _ := stub.CreateCompositeKey("Order", []string{ticketID, userID})
+	orderAsByte, _ := stub.GetState(key)
+
+	var order Order
+	_ = json.Unmarshal(orderAsByte, &order)
+
+	if order.Status == status {
+		return true
+	} else {
+		return false
+	}
+}
+
+func award(stub shim.ChaincodeStubInterface, ticketID string, userID_array []interface{}, value int) (bool, error) {
+	for _, userID := range userID_array {
+		logger.Info("-----xxx---------", "Credit_UerID_"+userID.(string))
+		credit, _ := retrieveSingleCredit(stub, "Credit_UerID_"+userID.(string))
+		// if order is done and ticketID not in credit.TicketIDs
+		if orderStatueEqual(stub, ticketID, userID.(string), 4) &&
+			!Is_Inarray(credit.TicketIDs, ticketID) {
+			credit.Value += value
+			credit.TicketIDs = append(credit.TicketIDs, ticketID)
+			logger.Info("-----xxx---------", credit)
+			creditAsByteArray, _ := json.Marshal(credit)
+			stub.PutState("Credit_UerID_"+credit.UserID, creditAsByteArray)
+
+			// update user's LoB total credit
+			_, err := updateLoBCredit(stub, userID.(string), value)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+	return true, nil
+}
+
+func updateLoBCredit(stub shim.ChaincodeStubInterface, userID string, value int) (bool, error) {
+	var participant Participant
+	var LoB_temp LoB
+
+	bytes, err := stub.GetState(userID)
+	if err != nil {
+		return false, errors.New("updateLoBCredit: Error get participant with ID: " + userID)
+	}
+	err = json.Unmarshal(bytes, &participant)
+	if err != nil {
+		return false, errors.New("updateLoBCredit: Corrupt reading record " + string(bytes))
+	}
+
+	LobName := Lob_Name[participant.LoBID]
+	bytes, err = stub.GetState(LobName)
+	if err != nil {
+		return false, errors.New("updateLoBCredit: Error getting LoB info from state")
+	}
+
+	err = json.Unmarshal(bytes, &LoB_temp)
+	if err != nil {
+		return false, errors.New("updateLoBCredit: Error unmarshalling LoB JSON")
+	}
+	LoB_temp.TotalCredit += value
+	bytes, err = json.Marshal(LoB_temp)
+	if err != nil {
+		return false, errors.New("updateLoBCredit: Error marshalling new LoB info")
+	}
+
+	err = stub.PutState(LobName, bytes)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (sc *SmartContract) OrderUpdate(stub shim.ChaincodeStubInterface, args []string) peer.Response {
+	var raw map[string]interface{}
+
+	err := json.Unmarshal([]byte(args[0]), &raw)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
+
+	var data []interface{}
+	var status = 0
+	ticketID := raw["TicketID"]
+	confirm := raw["Confirm"]
+	close := raw["Close"]
+	done := raw["Done"]
+	awarded := raw["Award"]
+
+	if ticketID == nil {
+		return shim.Error("OrderUpdate: TicketID is needed")
+	}
+	if close != nil {
+		_, err = OrderBlukUpdate(stub, ticketID, close.([]interface{}), status)
+		if err != nil {
+			return shim.Error("OrderUpdate:" + err.Error())
+		}
+	}
+
+	logger.Info("[OrderUpdate]--------------", raw)
+	logger.Info("[OrderUpdate]-----if start---------")
+	if confirm != nil {
+		data = confirm.([]interface{})
+		status = 2
+		_, err = OrderBlukUpdate(stub, ticketID, data, status)
+	} else if done != nil {
+		data = done.([]interface{})
+		status = 3
+		_, err = OrderBlukUpdate(stub, ticketID, data, status)
+	} else if awarded != nil {
+		data = awarded.([]interface{})
+		status = 4
+		_, err = OrderBlukUpdate(stub, ticketID, data, status)
+
+		logger.Info("-----1---------")
+		// Award user
+		var ticket Ticket
+		ticketAsBytes, err := stub.GetState(ticketID.(string))
+		if err != nil {
+			return shim.Error(err.Error())
+		}
+
+		err = json.Unmarshal(ticketAsBytes, &ticket)
+		if err != nil {
+			return shim.Error(err.Error())
+		}
+		award(stub, ticket.TicketID, data, ticket.Value)
+	}
+	logger.Info("[OrderUpdate]-----if end---------")
+
+	if err != nil {
+		return shim.Error("OrderUpdate:" + err.Error())
+	}
+
+	logger.Info("[OrderUpdate]-----order read2 start---------")
+	sc.OrderRead2(stub, []string{ticketID.(string)})
+	logger.Info("[OrderUpdate]-----order read2 start---------")
+
+	logger.Info("[OrderUpdate]-----time sleep start---------")
+	//time.Sleep(time.Second*30)
+	logger.Info("[OrderUpdate]-----time sleep end---------")
+	// update ticket status
+
+	logger.Info("[OrderUpdate]-----AutoUpdateTicketStatus start---------")
+	sc.AutoUpdateTicketStatus(stub, ticketID.(string))
+	logger.Info("[OrderUpdate]-----AutoUpdateTicketStatus end---------")
+	// ticket id & ticket object list
+
+	logger.Info("[OrderUpdate]-----order read2 2 start---------")
+	sc.OrderRead2(stub, []string{ticketID.(string)})
+	logger.Info("[OrderUpdate]-----order read2 2 start---------")
+
+	// to do
+	return shim.Success(nil)
+}
+
+func (sc *SmartContract) AutoUpdateTicketStatus(stub shim.ChaincodeStubInterface, args string) peer.Response {
+	var maxStatus = 0
+	var ticketID = args
+	var order Order
+	var ticket Ticket
+	logger.Info("AutoUpdateTicketStatus ticketID:", ticketID)
+	// Get all order to get max status
+	orderInterator, err :=
+		stub.GetStateByPartialCompositeKey("Order", []string{ticketID})
+
+	if err != nil {
+		logger.Info("AutoUpdateTicketStatus Error:", err)
+	}
+
+	var lognum = 1
+	logger.Info("AutoUpdateTicketStatus orderInterator 1 :", orderInterator)
+
+	queryResponse, _ := orderInterator.Next()
+	json.Unmarshal(queryResponse.Value, &order)
+
+	if maxStatus < order.Status {
+		maxStatus = order.Status
+	}
+	logger.Info("AutoUpdateTicketStatus order  : ", lognum, order)
+
+	logger.Info("AutoUpdateTicketStatus Interator for start...")
+	for orderInterator.HasNext() {
+		queryResponse, _ := orderInterator.Next()
+
+		json.Unmarshal(queryResponse.Value, &order)
+
+		lognum = lognum + 1
+		logger.Info("AutoUpdateTicketStatus order :", lognum, order)
+		if maxStatus < order.Status {
+			maxStatus = order.Status
+		}
+	}
+
+	ticketAsBytes, _ := stub.GetState(ticketID)
+	json.Unmarshal(ticketAsBytes, &ticket)
+
+	ticket.Status = maxStatus
+	logger.Info("AutoUpdateTicketStatus:", maxStatus)
+
+	ticketAsBytes, _ = json.Marshal(ticket)
+	stub.PutState(ticket.TicketID, ticketAsBytes)
+	return shim.Success(ticketAsBytes)
+}
+
+func string2time(st string) (theTime time.Time, err error) {
+	timeFormated := "2018-11-26 18:05:00"
+	loc, _ := time.LoadLocation("Local")
+	theTime, err = time.ParseInLocation(st, timeFormated, loc)
+	if err != nil {
+		return theTime, err
+	}
+	return theTime, nil
 }
